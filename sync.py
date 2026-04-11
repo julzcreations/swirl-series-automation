@@ -48,6 +48,51 @@ SCRIPT_GEN_WEEKDAYS = {0, 2, 5}
 # Allow overriding via env for manual runs / testing.
 FORCE_SCRIPT_GEN = os.environ.get("FORCE_SCRIPT_GEN", "").lower() in ("1", "true", "yes")
 
+# ---- Cost tracking ----
+# Per-million-token pricing in USD, from anthropic.com/pricing (2026).
+MODEL_PRICING = {
+    "claude-opus-4-6": (15.0, 75.0),
+    "claude-opus-4-6[1m]": (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (0.80, 4.0),
+}
+# Hard abort if a single run would exceed this (safety net against loops/bugs).
+MAX_COST_PER_RUN_USD = float(os.environ.get("MAX_COST_PER_RUN_USD", "2.00"))
+
+# Module-level cost tracker. Populated by track_usage() and read in main()'s summary.
+_run_usage = {
+    "total_usd": 0.0,
+    "by_model": {},  # model → {"input_tokens": int, "output_tokens": int, "cost_usd": float, "calls": int}
+}
+
+
+def track_usage(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Compute and record the $ cost of one API call. Returns the cost."""
+    pricing = MODEL_PRICING.get(model)
+    if not pricing:
+        # Unknown model — record tokens but zero cost (conservative).
+        cost = 0.0
+    else:
+        in_price, out_price = pricing
+        cost = (input_tokens / 1_000_000.0) * in_price + (output_tokens / 1_000_000.0) * out_price
+    _run_usage["total_usd"] += cost
+    bucket = _run_usage["by_model"].setdefault(
+        model, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+    )
+    bucket["input_tokens"] += input_tokens
+    bucket["output_tokens"] += output_tokens
+    bucket["cost_usd"] += cost
+    bucket["calls"] += 1
+    return cost
+
+
+def check_budget():
+    """Abort the run if total cost has exceeded MAX_COST_PER_RUN_USD."""
+    if _run_usage["total_usd"] >= MAX_COST_PER_RUN_USD:
+        raise RuntimeError(
+            f"Run cost ${_run_usage['total_usd']:.4f} reached max ${MAX_COST_PER_RUN_USD:.2f} — aborting."
+        )
+
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
@@ -505,11 +550,19 @@ def analyze_first_10s(client, frame_paths, caption):
         except Exception as e:
             print(f"  [warn] couldn't encode {fp}: {e}", file=sys.stderr)
     try:
+        check_budget()
         msg = client.messages.create(
             model=VISION_MODEL,
             max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
+        usage = getattr(msg, "usage", None)
+        if usage is not None:
+            cost = track_usage(VISION_MODEL, usage.input_tokens, usage.output_tokens)
+            print(
+                f"  [cost] {VISION_MODEL} (vision): {usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
+                file=sys.stderr,
+            )
         text = "".join(b.text for b in msg.content if b.type == "text").strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
@@ -726,11 +779,19 @@ def watch_time_seconds(row):
 
 # ---- Claude call helpers ----
 def _call_claude(client, model, prompt, max_tokens):
+    check_budget()
     msg = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
+    usage = getattr(msg, "usage", None)
+    if usage is not None:
+        cost = track_usage(model, usage.input_tokens, usage.output_tokens)
+        print(
+            f"  [cost] {model}: {usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
+            file=sys.stderr,
+        )
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
@@ -980,8 +1041,18 @@ def main():
         print("New script row: (skipped — not a script-gen day)")
     else:
         print("New script row: (not created)")
+    # Cost accounting
+    print(f"\n=== Cost ===")
+    print(f"Run total: ${_run_usage['total_usd']:.4f} (cap ${MAX_COST_PER_RUN_USD:.2f})")
+    for model, b in sorted(_run_usage["by_model"].items()):
+        print(
+            f"  {model}: {b['calls']} call(s) | "
+            f"{b['input_tokens']} in + {b['output_tokens']} out tokens | "
+            f"${b['cost_usd']:.4f}"
+        )
+
     if summary["errors"]:
-        print(f"Errors: {len(summary['errors'])}")
+        print(f"\nErrors: {len(summary['errors'])}")
         for e in summary["errors"]:
             print(f"  - {e}")
         sys.exit(1)
