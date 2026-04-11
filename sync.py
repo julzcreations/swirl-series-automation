@@ -13,7 +13,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from anthropic import Anthropic
@@ -50,10 +50,14 @@ def caption_key(s: str) -> str:
 
 
 def parse_ts(s):
+    """Parse an ISO timestamp or date string, always returning UTC-aware."""
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
