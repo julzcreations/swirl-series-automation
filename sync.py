@@ -64,16 +64,28 @@ def parse_ts(s):
 
 # ---- Step 1+2: IG ----
 def fetch_ig_reels():
+    """Fetch ALL reels by following Graph API cursor pagination."""
     url = f"https://graph.instagram.com/v21.0/{IG_USER_ID}/media"
     params = {
         "fields": "id,caption,media_type,media_product_type,permalink,timestamp,thumbnail_url",
-        "limit": 10,
+        "limit": 100,
         "access_token": IG_TOKEN,
     }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return [m for m in data if m.get("media_product_type") == "REELS"]
+    all_reels = []
+    next_url = url
+    next_params = params
+    while next_url:
+        r = requests.get(next_url, params=next_params, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        for m in payload.get("data", []):
+            if m.get("media_product_type") == "REELS":
+                all_reels.append(m)
+        next_url = payload.get("paging", {}).get("next")
+        next_params = None  # cursor URL already has everything
+        if not next_url:
+            break
+    return all_reels
 
 
 def fetch_insights(media_id: str) -> dict:
@@ -225,47 +237,98 @@ def match_reel_to_row(reel, rows, schema_props):
     return best
 
 
+# IG insight key → Notion column name
+METRIC_MAP = {
+    "views": "Views",
+    "likes": "Likes",
+    "comments": "Comments",
+    "saved": "Saves",
+    "shares": "Shares",
+    "reach": "Reach",
+}
+
+
+def is_reel_row(row) -> bool:
+    """True if this row represents a reel (reel number set OR title starts with 'Reel')
+    or was already reconciled to an IG post (Status == Posted).
+
+    Filters out non-reel pages like 'Asset library' from the reconcile loop.
+    """
+    if read_prop(row, "Reel #") is not None:
+        return True
+    if read_prop(row, "Status") in ("Posted", "Scripted"):
+        return True
+    title = (read_prop(row, "Title") or "").lower()
+    return title.startswith("reel ")
+
+
 def reconcile(reels, rows, schema_props):
-    updates = []
+    """Match each IG reel to an existing row.
+
+    Returns:
+      refreshes — (page_id, reel) pairs whose metrics should be refreshed
+      promotes  — (page_id, reel) pairs whose Status should flip to Posted
+      creates   — reels that need a brand-new row
+    """
+    refreshes = []
+    promotes = []
     creates = []
+    reel_candidates = [r for r in rows if is_reel_row(r)]
     for reel in reels:
-        match = match_reel_to_row(reel, rows, schema_props)
+        match = match_reel_to_row(reel, reel_candidates, schema_props)
         if match:
             status = read_prop(match, "Status")
             notes = read_prop(match, "Notes") or ""
             if status == "Scripted" and notes and "REGENERATE" not in notes:
-                continue  # protected
-            if status != "Posted":
-                updates.append((match["id"], reel))
+                continue  # protected Scripted row with content — leave alone
+            if status == "Posted":
+                refreshes.append((match["id"], reel))
+            else:
+                promotes.append((match["id"], reel))
         else:
             creates.append(reel)
-    return updates, creates
+    return refreshes, promotes, creates
 
 
-def insights_block(reel):
+def _metric_updates(reel, schema_props):
+    """Build a dict of metric column updates from a reel's insights."""
+    updates = {}
     ins = reel.get("_insights", {})
-    return " | ".join(f"{k}:{v}" for k, v in ins.items()) if ins else ""
+    for key, col in METRIC_MAP.items():
+        if col in schema_props and key in ins and ins[key] is not None:
+            updates[col] = ins[key]
+    if "Metrics Updated" in schema_props:
+        updates["Metrics Updated"] = datetime.now(timezone.utc).date().isoformat()
+    return updates
 
 
-def reel_notes_text(reel, prefix=""):
-    parts = [prefix] if prefix else []
-    parts.append(f"IG caption: {(reel.get('caption') or '').strip()}")
-    ib = insights_block(reel)
-    if ib:
-        parts.append(f"Insights: {ib}")
-    return "\n".join(parts)
+def _permalink_updates(reel, schema_props):
+    if "Permalink" in schema_props and reel.get("permalink"):
+        return {"Permalink": reel["permalink"]}
+    if "Link" in schema_props and reel.get("permalink"):
+        return {"Link": reel["permalink"]}
+    return {}
 
 
-def patch_row_posted(page_id, reel, schema_props):
-    updates = {"Status": "Posted"}
-    if "Permalink" in schema_props:
-        updates["Permalink"] = reel.get("permalink")
-    elif "Link" in schema_props:
-        updates["Link"] = reel.get("permalink")
-    if "Notes" in schema_props:
-        updates["Notes"] = reel_notes_text(reel)
+def _post_date_updates(reel, schema_props):
+    if "Post Date" in schema_props and reel.get("timestamp"):
+        return {"Post Date": reel["timestamp"][:10]}
     if "Posted Date" in schema_props and reel.get("timestamp"):
-        updates["Posted Date"] = reel["timestamp"][:10]
+        return {"Posted Date": reel["timestamp"][:10]}
+    return {}
+
+
+def refresh_row_metrics(page_id, reel, schema_props):
+    """Refresh metrics/permalink on a row that's already marked Posted.
+
+    Does NOT touch Status, Title, Caption, or any creative content fields.
+    """
+    updates = {}
+    updates.update(_metric_updates(reel, schema_props))
+    updates.update(_permalink_updates(reel, schema_props))
+    updates.update(_post_date_updates(reel, schema_props))
+    if not updates:
+        return None
     body = {"properties": build_props(schema_props, updates)}
     r = requests.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
@@ -275,16 +338,43 @@ def patch_row_posted(page_id, reel, schema_props):
     return r.json()
 
 
-def create_posted_row(reel, schema_props):
+def promote_row_to_posted(page_id, reel, schema_props):
+    """Flip a row to Posted and populate metrics + permalink + post date."""
+    updates = {"Status": "Posted"}
+    updates.update(_metric_updates(reel, schema_props))
+    updates.update(_permalink_updates(reel, schema_props))
+    updates.update(_post_date_updates(reel, schema_props))
+    body = {"properties": build_props(schema_props, updates)}
+    r = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=NOTION_HEADERS, json=body, timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def create_posted_row(reel, schema_props, reel_number=None):
+    """Create a brand-new Posted row from an IG reel we couldn't match."""
     title_prop = next((n for n, p in schema_props.items() if p["type"] == "title"), None)
-    cap = (reel.get("caption") or "Untitled")[:80]
-    updates = {title_prop: cap, "Status": "Posted"}
-    if "Permalink" in schema_props:
-        updates["Permalink"] = reel.get("permalink")
+    cap = (reel.get("caption") or "Untitled").strip()
+    # Build a title like "Reel 12 — <first ~60 chars of caption>"
+    first_line = cap.split("\n", 1)[0][:60].strip()
+    if reel_number is not None:
+        title_val = f"Reel {reel_number} — {first_line}" if first_line else f"Reel {reel_number}"
+    else:
+        title_val = first_line or "Untitled reel"
+
+    updates = {title_prop: title_val, "Status": "Posted"}
+    if reel_number is not None and "Reel #" in schema_props:
+        updates["Reel #"] = reel_number
+    if "Caption" in schema_props:
+        updates["Caption"] = cap[:2000]
     if "Notes" in schema_props:
-        updates["Notes"] = reel_notes_text(reel, prefix="Auto-created from IG sync")
-    if "Posted Date" in schema_props and reel.get("timestamp"):
-        updates["Posted Date"] = reel["timestamp"][:10]
+        updates["Notes"] = "Auto-created from IG sync"
+    updates.update(_metric_updates(reel, schema_props))
+    updates.update(_permalink_updates(reel, schema_props))
+    updates.update(_post_date_updates(reel, schema_props))
+
     body = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": build_props(schema_props, updates),
@@ -531,8 +621,9 @@ def create_script_row(script, hook_type, content_split, reel_num, schema_props):
 def main():
     summary = {
         "ig_fetched": 0,
-        "notion_updated": [],
-        "notion_created": [],
+        "metrics_refreshed": [],
+        "promoted_to_posted": [],
+        "auto_created": [],
         "new_script_row": None,
         "errors": [],
     }
@@ -549,21 +640,35 @@ def main():
         for r in reels:
             r["_insights"] = fetch_insights(r["id"])
 
-        updates, creates = reconcile(reels, rows, schema_props)
-        for page_id, reel in updates:
+        refreshes, promotes, creates = reconcile(reels, rows, schema_props)
+
+        # Refresh metrics on rows already marked Posted
+        for page_id, reel in refreshes:
             try:
-                patch_row_posted(page_id, reel, schema_props)
-                summary["notion_updated"].append(page_id)
+                refresh_row_metrics(page_id, reel, schema_props)
+                summary["metrics_refreshed"].append(page_id)
             except Exception as e:
-                summary["errors"].append(f"patch {page_id}: {e}")
+                summary["errors"].append(f"refresh {page_id}: {e}")
+
+        # Promote newly-matched rows to Posted
+        for page_id, reel in promotes:
+            try:
+                promote_row_to_posted(page_id, reel, schema_props)
+                summary["promoted_to_posted"].append(page_id)
+            except Exception as e:
+                summary["errors"].append(f"promote {page_id}: {e}")
+
+        # Create rows for unmatched IG reels, assigning Reel #s above the max
+        next_reel_num = max_reel_number(rows) + 1
         for reel in creates:
             try:
-                new_page = create_posted_row(reel, schema_props)
-                summary["notion_created"].append(new_page["id"])
+                new_page = create_posted_row(reel, schema_props, reel_number=next_reel_num)
+                summary["auto_created"].append(new_page["id"])
+                next_reel_num += 1
             except Exception as e:
                 summary["errors"].append(f"create posted: {e}")
 
-        # Re-query so the next-script logic sees the new rows
+        # Re-query so the next-script logic sees all the new/updated rows
         rows = notion_query_all()
 
         hook_type = pick_next_hook(rows)
@@ -586,11 +691,14 @@ def main():
 
     print("\n=== Summary ===")
     print(f"IG reels fetched: {summary['ig_fetched']}")
-    print(f"Notion rows updated to Posted: {len(summary['notion_updated'])}")
-    for pid in summary["notion_updated"]:
+    print(f"Metrics refreshed on existing Posted rows: {len(summary['metrics_refreshed'])}")
+    for pid in summary["metrics_refreshed"]:
         print(f"  - {pid}")
-    print(f"Notion rows auto-created: {len(summary['notion_created'])}")
-    for pid in summary["notion_created"]:
+    print(f"Rows promoted to Posted: {len(summary['promoted_to_posted'])}")
+    for pid in summary["promoted_to_posted"]:
+        print(f"  - {pid}")
+    print(f"Rows auto-created: {len(summary['auto_created'])}")
+    for pid in summary["auto_created"]:
         print(f"  - {pid}")
     if summary["new_script_row"]:
         print(f"New script row: {summary['new_script_row']['id']} — {summary['new_script_row']['title']}")
