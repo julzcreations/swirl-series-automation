@@ -28,5 +28,6 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CLAUDE_MODEL: claude-opus-4-6
+          ANALYST_MODEL: claude-opus-4-6
+          WRITER_MODEL: claude-sonnet-4-6
         run: python sync.py

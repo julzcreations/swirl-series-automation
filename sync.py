@@ -24,7 +24,10 @@ IG_USER_ID = os.environ["IG_USER_ID"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = os.environ["NOTION_DB_ID"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
+# Two-model setup: Opus reasons over past performance and drafts a creative
+# brief; Sonnet turns the brief into the final reel script JSON.
+ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-opus-4-6")
+WRITER_MODEL = os.environ.get("WRITER_MODEL", "claude-sonnet-4-6")
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -338,22 +341,51 @@ def max_reel_number(rows):
     return n
 
 
-PROMPT_TMPL = """You are writing the next Instagram reel script for Swirlie, a latte art practice app.
+ANALYST_PROMPT = """You are the creative strategist for Swirlie, an indie latte art practice app. Brand voice: hand-drawn chalk-coffee-shop aesthetic, cozy, intentional, warm — quiet morning ritual meets indie coffee shop chalkboard.
+
+You're planning the NEXT Instagram reel. A separate writer will turn your brief into the actual script, so your job is judgment, not prose. Analyze past performance, decide the angle, and hand the writer a clear direction.
+
+Fixed constraints for the next reel (already chosen by rotation logic — don't override):
+- Hook Type: {hook_type}
+- Content Split: {content_split}
+
+Recent POSTED reels (with performance notes where available):
+{past_posted}
+
+Recent SCRIPTED but not-yet-posted reels (avoid duplication):
+{past_scripted}
+
+Return a short creative brief as a JSON object with these keys:
+{{
+  "theme": "2-4 word theme label for this reel",
+  "angle": "1-2 sentences on the specific angle/idea and why it fits the fixed hook type + content split",
+  "informed_by": "cite 1-3 past reels by number and what specifically from each is shaping this decision (e.g. 'Reel #12 overperformed on saves for its close-up steam wand shots — lean into ASMR-style detail framing'). If no posted reels exist yet, say 'No performance data yet — establishing baseline.'",
+  "avoid": "1 sentence on what NOT to do — duplicate themes, overused visuals, or tone misses",
+  "mood": "3-5 comma-separated mood/aesthetic words for the writer"
+}}
+
+Return ONLY the JSON object. No prose, no code fencing."""
+
+
+WRITER_PROMPT = """You are writing the next Instagram reel script for Swirlie, a latte art practice app.
 
 Brand voice: hand-drawn chalk-coffee-shop aesthetic, cozy, intentional, warm. Indie coffee shop chalkboard meets quiet morning ritual.
 
-Constraints for this reel:
+The creative strategist has already analyzed past performance and handed you this brief:
+
+Theme: {theme}
+Angle: {angle}
+Informed by: {informed_by}
+Avoid: {avoid}
+Mood: {mood}
+
+Fixed constraints:
 - Hook Type: {hook_type}
 - Content Split: {content_split}
 - Reel Total Time: 15-30 seconds
 - Caption must include these hashtags: #latteart #swirlie #coffeeshop #baristalife (plus 4-8 more relevant ones, 8-12 total)
-- Do NOT duplicate any past reel idea. Riff on themes that performed well.
 
-Recent POSTED reels (with performance notes if available):
-{past_posted}
-
-Recent SCRIPTED reels (to avoid duplication):
-{past_scripted}
+Your job: write the full reel script that executes the brief. Match the mood words exactly.
 
 Return ONLY a JSON object with these exact keys:
 {{
@@ -365,7 +397,7 @@ Return ONLY a JSON object with these exact keys:
   "suno_prompt": "lo-fi acoustic cozy music direction",
   "transitions": "brief notes on cuts / match cuts / whip pans",
   "reel_total_time": "20s",
-  "notes": "2-3 sentence rationale citing which past reels informed this choice"
+  "notes": "2-3 sentence rationale. MUST begin by citing the theme and the past reels named in 'informed_by'."
 }}
 
 Return only the JSON, no prose, no code fencing."""
@@ -381,31 +413,62 @@ def summarize_row_for_prompt(row):
     return f"Reel #{reel_num} [{hook}/{split}] {title} — {cap[:100]} | {notes[:200]}"
 
 
-def generate_script(rows, hook_type, content_split):
-    posted = [r for r in rows if read_prop(r, "Status") == "Posted"][:8]
-    scripted = [r for r in rows if read_prop(r, "Status") == "Scripted"][:6]
-    prompt = PROMPT_TMPL.format(
-        hook_type=hook_type,
-        content_split=content_split,
-        past_posted="\n".join(summarize_row_for_prompt(r) for r in posted) or "(none yet)",
-        past_scripted="\n".join(summarize_row_for_prompt(r) for r in scripted) or "(none yet)",
-    )
-    client = Anthropic(api_key=ANTHROPIC_KEY)
+def _call_claude(client, model, prompt, max_tokens):
     msg = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=2000,
+        model=model,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
-    data = json.loads(text)
+    return json.loads(text)
+
+
+def analyze_context(client, rows, hook_type, content_split):
+    """Pass 1 — Opus: strategic analysis over past performance → creative brief."""
+    posted = [r for r in rows if read_prop(r, "Status") == "Posted"][:15]
+    scripted = [r for r in rows if read_prop(r, "Status") == "Scripted"][:6]
+    prompt = ANALYST_PROMPT.format(
+        hook_type=hook_type,
+        content_split=content_split,
+        past_posted="\n".join(summarize_row_for_prompt(r) for r in posted) or "(none yet)",
+        past_scripted="\n".join(summarize_row_for_prompt(r) for r in scripted) or "(none yet)",
+    )
+    brief = _call_claude(client, ANALYST_MODEL, prompt, max_tokens=600)
+    print(
+        f"Analyst ({ANALYST_MODEL}): theme='{brief.get('theme')}' "
+        f"informed_by='{brief.get('informed_by','')[:80]}'",
+        file=sys.stderr,
+    )
+    return brief
+
+
+def write_script(client, brief, hook_type, content_split):
+    """Pass 2 — Sonnet: turn the brief into the final reel script JSON."""
+    prompt = WRITER_PROMPT.format(
+        theme=brief.get("theme", ""),
+        angle=brief.get("angle", ""),
+        informed_by=brief.get("informed_by", ""),
+        avoid=brief.get("avoid", ""),
+        mood=brief.get("mood", ""),
+        hook_type=hook_type,
+        content_split=content_split,
+    )
+    data = _call_claude(client, WRITER_MODEL, prompt, max_tokens=2000)
     caption = data.get("caption", "")
     for h in REQUIRED_HASHTAGS:
         if h.lower() not in caption.lower():
             caption += f" {h}"
     data["caption"] = caption
     return data
+
+
+def generate_script(rows, hook_type, content_split):
+    """Two-pass script generation: Opus analyzes, Sonnet writes."""
+    client = Anthropic(api_key=ANTHROPIC_KEY)
+    brief = analyze_context(client, rows, hook_type, content_split)
+    return write_script(client, brief, hook_type, content_split)
 
 
 def apply_script_to_row(page_id, script, hook_type, content_split, schema_props):

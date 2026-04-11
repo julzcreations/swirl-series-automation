@@ -6,11 +6,12 @@ Daily GitHub Actions job that keeps the Swirlie Notion content calendar in sync 
 
 1. **Fetch** the last ~10 IG reels and their insights (reach, likes, comments, saves, shares, views).
 2. **Reconcile** against the Notion DB: match by caption similarity or ±2-day date proximity, PATCH matched rows to `Status = Posted` with permalink/insights/caption stored in Notes. Create new rows for unmatched reels. Never deletes. Never overwrites a `Scripted` row with content unless its Notes contains the literal token `REGENERATE`.
-3. **Generate** the next Scripted row via Claude:
+3. **Generate** the next Scripted row via a two-model Claude pipeline:
    - Hook Type cycles Curiosity / Visual Movement / Unpredictability (least-recently-used)
    - Content Split stays ~50/50 between App/Lifestyle Blend and Lifestyle (whichever's behind)
-   - Leans toward themes of above-average-performing past reels; won't duplicate
-4. **Fill** Title, Clip Order, On-Screen Text, Caption (8–12 hashtags including the four required ones), Cover Scene, Suno Prompt, Transitions, Reel Total Time, Notes rationale.
+   - **Analyst pass** (Opus 4.6 by default): reasons over past performance data, picks the theme/angle, cites which past reels are shaping the decision, warns off duplicates. Returns a short creative brief.
+   - **Writer pass** (Sonnet 4.6 by default): takes the brief + constraints and produces the final reel script JSON.
+4. **Fill** Title, Clip Order, On-Screen Text, Caption (8–12 hashtags including the four required ones), Cover Scene, Suno Prompt, Transitions, Reel Total Time, Notes rationale (which begins with the analyst's citations).
 
 Idempotent — running twice in the same day is a no-op on step 2 and will refresh/replace the generated row on step 3.
 
@@ -48,6 +49,17 @@ gh run watch
 ### 3. Schedule
 
 The cron is `0 15 * * *` (15:00 UTC daily), which is 10am CST / 11am CDT. Edit `.github/workflows/swirl-sync.yml` if you want a different time.
+
+## Model configuration
+
+Two models are used per run (configurable via env in the workflow):
+
+| Env var | Default | Role |
+| --- | --- | --- |
+| `ANALYST_MODEL` | `claude-opus-4-6` | Reasons over past performance, picks theme/angle, cites informative reels |
+| `WRITER_MODEL` | `claude-sonnet-4-6` | Writes the final reel script JSON from the analyst's brief |
+
+To run cheaper (~$0.015/run vs ~$0.065), set both to `claude-sonnet-4-6`. To run everything on Opus for max quality, set both to `claude-opus-4-6`.
 
 ## Notion schema expectations
 
