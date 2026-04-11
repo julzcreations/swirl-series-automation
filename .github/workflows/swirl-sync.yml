@@ -2,15 +2,23 @@ name: Swirl Series Sync
 
 on:
   schedule:
-    # 10:00 America/Chicago = 15:00 UTC (standard time) / 14:00 UTC (DST)
-    # Running at 15:00 UTC year-round keeps it 10am CST / 11am CDT.
+    # Daily at 15:00 UTC (= 10am CST / 11am CDT). The script itself gates
+    # script-generation to Mon/Wed/Sat; metrics refresh and frame analysis
+    # run every day so engagement numbers stay fresh and new posts get
+    # analyzed promptly.
     - cron: '0 15 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_script_gen:
+        description: 'Force script generation even on non-gen days (true/false)'
+        required: false
+        default: 'false'
+        type: string
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +27,11 @@ jobs:
           python-version: '3.12'
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
 
       - name: Run sync
         env:
@@ -30,4 +42,6 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANALYST_MODEL: claude-opus-4-6
           WRITER_MODEL: claude-sonnet-4-6
+          VISION_MODEL: claude-sonnet-4-6
+          FORCE_SCRIPT_GEN: ${{ inputs.force_script_gen || 'false' }}
         run: python sync.py
