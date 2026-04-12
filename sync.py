@@ -751,6 +751,7 @@ Suggested hashtags: {suggested_hashtags}
 - Content Split: {content_split}
 - Reel Total Time: 12-18 seconds (shorter end preferred)
 - Caption: exactly 5 hashtags, no more, no less. Use the suggested hashtags from the brief unless you have a strong reason otherwise.
+- **Caption voice rule**: Julie writes captions with LOWERCASE sentence starts — deliberate aesthetic, not a typo. "the hour before anything is asked of you" not "The hour...". Proper nouns (Swirlie, place names, brand names), acronyms, and the word "I" still get capitalized normally. Preserve this voice in every caption you generate.
 - NEVER open with an app/product screen (hard rule from Reel 5→6 A/B test)
 - Avoid passive wide shots from behind and black text transition cards (killed retention on Reel 5)
 
