@@ -33,8 +33,15 @@ import requests
 from anthropic import Anthropic
 
 # ---- Config from env ----
-IG_TOKEN = os.environ["IG_TOKEN"]
+# IG_TOKEN is loaded lazily from the Notion Asset library page (primary) or
+# the env var (fallback). See load_ig_token() and the Asset library design.
+_IG_TOKEN = None  # set by load_ig_token() at the start of main()
 IG_USER_ID = os.environ["IG_USER_ID"]
+# The Asset library page in the Swirl Series Content Calendar DB.
+# Its body content IS the IG token — nothing else.
+ASSET_LIBRARY_PAGE_ID = os.environ.get(
+    "ASSET_LIBRARY_PAGE_ID", "33f52fb3-31e4-8114-9809-cadcc5191947"
+)
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = os.environ["NOTION_DB_ID"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -147,19 +154,78 @@ def format_watch_time_ms(ms) -> str:
         return ""
 
 
-# ---- IG token refresh ----
-def refresh_ig_token_if_needed():
-    """Refresh the long-lived IG token if it's older than 50 days.
+# ---- IG token management (Notion Asset library is the source of truth) ----
+def _read_notion_page_content(page_id: str) -> str:
+    """Read a Notion page's block children and return their plain text."""
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    r = requests.get(url, headers=NOTION_HEADERS, timeout=30)
+    r.raise_for_status()
+    texts = []
+    for block in r.json().get("results", []):
+        btype = block.get("type", "")
+        inner = block.get(btype, {})
+        for rt in inner.get("rich_text", []):
+            texts.append(rt.get("plain_text", ""))
+    return "".join(texts).strip()
 
-    IG long-lived tokens last 60 days. We refresh at 50 to avoid edge cases.
-    The refreshed token is valid for another 60 days. We update the GitHub
-    Actions secret automatically via the gh CLI (requires GITHUB_TOKEN with
-    repo scope, which GitHub Actions provides by default).
 
-    Returns True if the token was refreshed, False otherwise.
+def _write_notion_page_content(page_id: str, text: str):
+    """Replace a Notion page's content with a single paragraph block."""
+    # First, delete all existing children
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+    r = requests.get(url, headers=NOTION_HEADERS, timeout=30)
+    r.raise_for_status()
+    for block in r.json().get("results", []):
+        requests.delete(
+            f"https://api.notion.com/v1/blocks/{block['id']}",
+            headers=NOTION_HEADERS, timeout=30,
+        )
+    # Then append the new content as a single paragraph
+    requests.patch(
+        url,
+        headers=NOTION_HEADERS,
+        json={"children": [
+            {"type": "paragraph", "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": text}}]
+            }}
+        ]},
+        timeout=30,
+    )
+
+
+def load_ig_token() -> str:
+    """Load the IG token from the Notion Asset library page (primary) or the
+    env var (fallback). Returns the token string."""
+    global _IG_TOKEN
+    try:
+        token = _read_notion_page_content(ASSET_LIBRARY_PAGE_ID)
+        if token and len(token) > 50:
+            print(f"  [token] IG token loaded from Notion Asset library ({len(token)} chars)", file=sys.stderr)
+            _IG_TOKEN = token
+            return token
+    except Exception as e:
+        print(f"  [warn] couldn't read IG token from Notion: {e}", file=sys.stderr)
+    # Fallback to env var
+    token = os.environ.get("IG_TOKEN", "")
+    if token:
+        print("  [token] IG token loaded from env var (fallback)", file=sys.stderr)
+        _IG_TOKEN = token
+    else:
+        raise RuntimeError("No IG token found in Notion Asset library or IG_TOKEN env var")
+    return _IG_TOKEN
+
+
+def refresh_ig_token():
+    """Refresh the long-lived IG token and write the new one back to Notion.
+
+    IG long-lived tokens last 60 days. Calling the refresh endpoint every run
+    resets the window (idempotent). The refreshed token is written back to the
+    Asset library page in Notion (the source of truth) and also to the GH
+    Actions secret if gh CLI is available (belt + suspenders).
     """
+    global _IG_TOKEN
     url = "https://graph.instagram.com/refresh_access_token"
-    params = {"grant_type": "ig_refresh_token", "access_token": IG_TOKEN}
+    params = {"grant_type": "ig_refresh_token", "access_token": _IG_TOKEN}
     try:
         r = requests.get(url, params=params, timeout=30)
         if r.status_code >= 400:
@@ -171,26 +237,27 @@ def refresh_ig_token_if_needed():
         if not new_token:
             print("  [warn] IG token refresh: no new token in response", file=sys.stderr)
             return False
-        # Update the GitHub Actions secret via gh CLI
-        repo = os.environ.get("GITHUB_REPOSITORY", "jw-yue/swirl-series-automation")
-        result = subprocess.run(
-            ["gh", "secret", "set", "IG_TOKEN", "--body", new_token, "--repo", repo],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            print(
-                f"  [token] IG token refreshed (expires_in={expires_in}s, "
-                f"~{int(int(expires_in) / 86400) if str(expires_in).isdigit() else '?'} days). "
-                f"GitHub secret updated.",
-                file=sys.stderr,
+        # Write to Notion (primary)
+        try:
+            _write_notion_page_content(ASSET_LIBRARY_PAGE_ID, new_token)
+            print(f"  [token] Notion Asset library updated with refreshed token", file=sys.stderr)
+        except Exception as e:
+            print(f"  [warn] Notion token write failed: {e}", file=sys.stderr)
+        # Also update GH secret if gh CLI is available (backup)
+        try:
+            repo = os.environ.get("GITHUB_REPOSITORY", "jw-yue/swirl-series-automation")
+            result = subprocess.run(
+                ["gh", "secret", "set", "IG_TOKEN", "--body", new_token, "--repo", repo],
+                capture_output=True, text=True, timeout=30,
             )
-            return True
-        else:
-            print(
-                f"  [warn] IG token refreshed but gh secret update failed: {result.stderr[:200]}",
-                file=sys.stderr,
-            )
-            return False
+            if result.returncode == 0:
+                print(f"  [token] GH secret also updated", file=sys.stderr)
+        except Exception:
+            pass  # gh CLI not available in all environments — Notion is the truth
+        _IG_TOKEN = new_token
+        days = int(int(expires_in) / 86400) if str(expires_in).isdigit() else "?"
+        print(f"  [token] IG token refreshed (expires_in={expires_in}s, ~{days} days)", file=sys.stderr)
+        return True
     except Exception as e:
         print(f"  [warn] IG token refresh error: {e}", file=sys.stderr)
         return False
@@ -206,7 +273,7 @@ def fetch_ig_reels():
     params = {
         "fields": "id,caption,media_type,media_product_type,permalink,timestamp,thumbnail_url,media_url",
         "limit": 100,
-        "access_token": IG_TOKEN,
+        "access_token": _IG_TOKEN,
     }
     all_reels = []
     next_url = url
@@ -1112,10 +1179,10 @@ def main():
     anthropic_client = Anthropic(api_key=ANTHROPIC_KEY)
 
     try:
-        # Refresh the IG token proactively every run. The endpoint is idempotent
-        # and resets the 60-day expiry window. If it fails, the run continues
-        # with the current token (which is still valid unless expired).
-        refresh_ig_token_if_needed()
+        # Load IG token from Notion Asset library (primary) or env var (fallback),
+        # then refresh it proactively to reset the 60-day expiry window.
+        load_ig_token()
+        refresh_ig_token()
 
         db = notion_get_db()
         schema_props = db["properties"]
