@@ -147,6 +147,55 @@ def format_watch_time_ms(ms) -> str:
         return ""
 
 
+# ---- IG token refresh ----
+def refresh_ig_token_if_needed():
+    """Refresh the long-lived IG token if it's older than 50 days.
+
+    IG long-lived tokens last 60 days. We refresh at 50 to avoid edge cases.
+    The refreshed token is valid for another 60 days. We update the GitHub
+    Actions secret automatically via the gh CLI (requires GITHUB_TOKEN with
+    repo scope, which GitHub Actions provides by default).
+
+    Returns True if the token was refreshed, False otherwise.
+    """
+    url = "https://graph.instagram.com/refresh_access_token"
+    params = {"grant_type": "ig_refresh_token", "access_token": IG_TOKEN}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code >= 400:
+            print(f"  [warn] IG token refresh failed: {r.status_code} {r.text[:200]}", file=sys.stderr)
+            return False
+        r.raise_for_status()
+        new_token = r.json().get("access_token")
+        expires_in = r.json().get("expires_in", "?")
+        if not new_token:
+            print("  [warn] IG token refresh: no new token in response", file=sys.stderr)
+            return False
+        # Update the GitHub Actions secret via gh CLI
+        repo = os.environ.get("GITHUB_REPOSITORY", "jw-yue/swirl-series-automation")
+        result = subprocess.run(
+            ["gh", "secret", "set", "IG_TOKEN", "--body", new_token, "--repo", repo],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            print(
+                f"  [token] IG token refreshed (expires_in={expires_in}s, "
+                f"~{int(int(expires_in) / 86400) if str(expires_in).isdigit() else '?'} days). "
+                f"GitHub secret updated.",
+                file=sys.stderr,
+            )
+            return True
+        else:
+            print(
+                f"  [warn] IG token refreshed but gh secret update failed: {result.stderr[:200]}",
+                file=sys.stderr,
+            )
+            return False
+    except Exception as e:
+        print(f"  [warn] IG token refresh error: {e}", file=sys.stderr)
+        return False
+
+
 # ---- IG Graph API ----
 def fetch_ig_reels():
     """Fetch ALL reels by following Graph API cursor pagination.
@@ -1063,6 +1112,11 @@ def main():
     anthropic_client = Anthropic(api_key=ANTHROPIC_KEY)
 
     try:
+        # Refresh the IG token proactively every run. The endpoint is idempotent
+        # and resets the 60-day expiry window. If it fails, the run continues
+        # with the current token (which is still valid unless expired).
+        refresh_ig_token_if_needed()
+
         db = notion_get_db()
         schema_props = db["properties"]
         rows = notion_query_all()

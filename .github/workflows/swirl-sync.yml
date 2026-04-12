@@ -33,6 +33,14 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &>/dev/null; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli-stable.list > /dev/null
+            sudo apt-get update && sudo apt-get install -y gh
+          fi
+
       - name: Run sync
         env:
           IG_TOKEN: ${{ secrets.IG_TOKEN }}
@@ -44,8 +52,8 @@ jobs:
           WRITER_MODEL: claude-sonnet-4-6
           VISION_MODEL: claude-sonnet-4-6
           FORCE_SCRIPT_GEN: ${{ inputs.force_script_gen || 'false' }}
-          # Safety net: abort the run if total Claude API spend exceeds this.
-          # Typical run: ~$0.15 (script gen) or ~$0.05 per new reel (frame analysis).
-          # A healthy run should be under $0.50 even with multiple new reels.
           MAX_COST_PER_RUN_USD: '2.00'
+          # gh CLI needs auth to update the IG_TOKEN secret on auto-refresh.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python sync.py
