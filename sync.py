@@ -478,9 +478,18 @@ def download_mp4(media_url: str, out_path: str) -> bool:
         return False
 
 
-# Timestamps (seconds) to extract frames at — weighted toward first 3s
-# where retention dies.
-FRAME_TIMESTAMPS = [0.0, 0.5, 1.0, 1.5, 2.5, 4.0, 7.0]
+# Timestamps (seconds) to extract frames at. 15 frames covering the full reel
+# arc, weighted toward the first 3 seconds (where retention dies) and the
+# end (where the loop/payoff lives).
+# ffmpeg silently drops timestamps past the reel's actual duration, so shorter
+# reels just yield fewer usable frames — no need to fetch duration upfront.
+FRAME_TIMESTAMPS = [
+    0.0, 0.3, 0.7, 1.2, 1.8, 2.5,   # 6 dense in first 2.5s — the retention critical zone
+    3.5, 5.0,                        # 2 early-mid
+    7.0, 9.5,                        # 2 mid
+    12.0, 15.0,                      # 2 late-mid
+    18.0, 22.0, 27.0,                # 3 toward end (longer reels only)
+]
 
 
 def extract_frames(mp4_path: str, out_dir: str) -> list:
@@ -505,29 +514,42 @@ def extract_frames(mp4_path: str, out_dir: str) -> list:
     return frame_paths
 
 
-VISION_PROMPT = """You are analyzing the first ~10 seconds of an Instagram reel for a latte art practice app called Swirlie. These frames are in chronological order: 0s, 0.5s, 1s, 1.5s, 2.5s, 4s, 7s.
+VISION_PROMPT = """You are analyzing the FULL ARC of an Instagram reel for a latte art practice app called Swirlie. You're receiving up to 15 frames in chronological order:
 
-The creator (Julie) is trying to maximize avg watch time. Specifically track:
-- Is there a human in frame? Where (hand, face, full body, shadow)? When do they first appear?
-- Is there an app/product screen in frame? If so, when — is it the first frame, or later?
-- Is the opener a passive wide shot, a close-up, or a mid-action moment?
-- Wardrobe/styling: if a person is visible, describe outfit, styling, color palette. Is it visually distinctive?
-- On-screen text: any overlays in these frames? What do they say?
-- Transition density: are consecutive frames clearly different scenes (fast cuts) or slight variations (slow / single scene)?
-- Overall aesthetic tags: 3-5 descriptors (cozy, chaotic, minimal, warm, chalky, clean, etc.)
+  0.0s, 0.3s, 0.7s, 1.2s, 1.8s, 2.5s  — dense sampling of the first 2.5s (retention-critical zone)
+  3.5s, 5.0s, 7.0s, 9.5s               — early-to-mid section
+  12.0s, 15.0s                         — late-mid section
+  18.0s, 22.0s, 27.0s                  — toward end (may be absent for shorter reels)
+
+Short reels just yield fewer frames, which is fine. The creator (Julie) is trying to maximize avg watch time AND understand how the full reel arc drives retention (not just the opener).
+
+Track across the WHOLE reel:
+- First frame — what is it? Human / app-product / wide-scene / close-up-object / text-card?
+- When does a human first appear? (hand, face, shadow, full body) — timestamp matters
+- If a human is visible: wardrobe, styling, color palette, anything K-drama-cohesive or distinctive
+- Where/when does any app or product screen appear? Is it texture or subject?
+- On-screen text across the reel — all overlays, in order
+- Transition density: how fast are cuts throughout? Front-loaded, evenly-paced, back-loaded?
+- Mid-reel beats: what happens around 5-10s (where Reel 5 dropped retention)?
+- End / payoff: what's the last frame? Does it loop naturally?
+- Overall aesthetic tags: 3-5 descriptors
 
 Return ONLY a JSON object with these keys:
 {
   "first_frame_type": "one of: human-in-frame / app-or-product / wide-scene / close-up-object / text-card",
   "first_frame_description": "one sentence",
   "human_present_in_first_3s": true or false,
-  "wardrobe_notes": "brief description or 'N/A' if no human visible",
+  "human_first_appearance": "timestamp like '0s', '1.2s', '4s', or 'never'",
+  "wardrobe_notes": "brief description across all frames showing a human, or 'N/A'",
   "app_appearance_timing": "one of: first_frame / within_3s / middle / end / not_visible",
-  "on_screen_text": "quoted text or 'none'",
-  "transition_density": "one of: fast / moderate / slow / single_scene",
+  "on_screen_text_sequence": "overlay text in order separated by ' | ', or 'none'",
+  "transition_density_by_section": "describe pacing in first_3s / mid / end (e.g. 'first_3s: fast; mid: slow; end: hard_cut')",
+  "mid_reel_beat": "1 sentence on what's happening around 5-10s",
+  "end_beat": "1 sentence on the final frame / how the reel closes",
   "aesthetic_tags": ["tag1", "tag2", "tag3"],
-  "retention_concerns": "1 sentence: what in these first frames might cause viewers to scroll past",
-  "retention_strengths": "1 sentence: what in these first frames might keep viewers watching"
+  "retention_concerns": "1 sentence: what in this arc might cause viewers to scroll or drop off mid-reel",
+  "retention_strengths": "1 sentence: what in this arc is working and should be repeated",
+  "arc_hypothesis": "1 sentence: if this reel had high/low avg watch time, your best guess for why based on what you see"
 }
 
 Return only the JSON, no prose."""
@@ -573,12 +595,12 @@ def analyze_first_10s(client, frame_paths, caption):
 
 
 def analyze_reel_frames_if_needed(client, row, reel, schema_props):
-    """If the row doesn't yet have First 10s Analysis, download MP4, extract
-    frames, run vision, and write the result. Returns True if analysis was
-    written."""
-    if "First 10s Analysis" not in schema_props:
+    """If the row doesn't yet have Reel Vision Analysis, download MP4, extract
+    15 frames across the full reel arc, run vision, and write the result.
+    Returns True if analysis was written."""
+    if "Reel Vision Analysis" not in schema_props:
         return False
-    existing = read_prop(row, "First 10s Analysis")
+    existing = read_prop(row, "Reel Vision Analysis")
     if existing and existing.strip():
         return False
     media_url = reel.get("media_url")
@@ -593,24 +615,29 @@ def analyze_reel_frames_if_needed(client, row, reel, schema_props):
         if not frames:
             print(f"  [warn] no frames extracted for reel {reel.get('id')}", file=sys.stderr)
             return False
+        print(f"  [vision] analyzing {len(frames)} frames for reel {reel.get('id')}", file=sys.stderr)
         analysis = analyze_first_10s(client, frames, reel.get("caption", ""))
     if not analysis:
         return False
     # Format as a compact text blob the analyst can read
     summary = (
         f"First frame: {analysis.get('first_frame_type','?')} — {analysis.get('first_frame_description','')}\n"
+        f"Human first appears: {analysis.get('human_first_appearance','?')}\n"
         f"Human in first 3s: {analysis.get('human_present_in_first_3s','?')}\n"
         f"Wardrobe: {analysis.get('wardrobe_notes','')}\n"
         f"App appears: {analysis.get('app_appearance_timing','?')}\n"
-        f"On-screen text: {analysis.get('on_screen_text','none')}\n"
-        f"Transition density: {analysis.get('transition_density','?')}\n"
+        f"On-screen text sequence: {analysis.get('on_screen_text_sequence','none')}\n"
+        f"Transition density: {analysis.get('transition_density_by_section','?')}\n"
+        f"Mid-reel beat: {analysis.get('mid_reel_beat','')}\n"
+        f"End beat: {analysis.get('end_beat','')}\n"
         f"Aesthetic: {', '.join(analysis.get('aesthetic_tags', []))}\n"
         f"Retention concerns: {analysis.get('retention_concerns','')}\n"
-        f"Retention strengths: {analysis.get('retention_strengths','')}"
+        f"Retention strengths: {analysis.get('retention_strengths','')}\n"
+        f"Arc hypothesis: {analysis.get('arc_hypothesis','')}"
     )
     _patch_row(
         row["id"],
-        {"properties": build_props(schema_props, {"First 10s Analysis": summary})},
+        {"properties": build_props(schema_props, {"Reel Vision Analysis": summary})},
     )
     return True
 
@@ -716,6 +743,9 @@ Mood: {mood}
 Wardrobe direction: {wardrobe_direction}
 Suggested hashtags: {suggested_hashtags}
 
+## Variation direction for THIS pass
+{variation_hint}
+
 ## Fixed constraints
 - Hook Type: {hook_type}
 - Content Split: {content_split}
@@ -725,7 +755,7 @@ Suggested hashtags: {suggested_hashtags}
 - Avoid passive wide shots from behind and black text transition cards (killed retention on Reel 5)
 
 ## Your job
-Write the full reel script executing the brief. Match the mood words exactly. If the brief includes wardrobe direction, bake it into the clip descriptions explicitly (what she's wearing, color palette, styling detail).
+Write the full reel script executing the brief under the variation direction above. Match the mood words exactly. If the brief includes wardrobe direction, bake it into the clip descriptions explicitly (what she's wearing, color palette, styling detail).
 
 Return ONLY a JSON object with these exact keys:
 {{
@@ -737,13 +767,44 @@ Return ONLY a JSON object with these exact keys:
   "suno_prompt": "lo-fi acoustic cozy music direction",
   "transitions": "brief notes on cuts / match cuts / whip pans — avoid black text cards",
   "reel_total_time": "14s",
-  "notes": "2-3 sentence rationale. MUST begin by citing the theme and the past reels named in 'informed_by', then state the specific hypothesis this reel is testing."
+  "notes": "2-3 sentence rationale. MUST begin by citing the theme and the past reels named in 'informed_by', then state the specific hypothesis this reel is testing.",
+  "variation_label": "one of: Text-forward / Visual-only / Humor-led"
 }}
 
 Return only the JSON, no prose, no code fencing."""
 
 
-def summarize_row_for_prompt(row):
+# Three variation directives used across the writer's three passes. The
+# analyst picks a theme; the writer executes it three different ways.
+VARIATION_HINTS = [
+    (
+        "Text-forward",
+        "Include 2-3 on-screen text overlays that carry meaning "
+        "(title beat, observation, payoff). Text should feel hand-drawn/chalky, never a "
+        "plain black card. Let on-screen text do half the storytelling.",
+    ),
+    (
+        "Visual-only",
+        "Minimize on-screen text (1 overlay max, often zero). Let composition, motion, "
+        "wardrobe, and light carry the entire story. This is the cinematic variation — "
+        "should feel like a 14-second short film.",
+    ),
+    (
+        "Humor-led",
+        "Inject one unexpected humor beat — a self-deprecating moment, a quiet visual gag, "
+        "or a caption that breaks the cozy register briefly before returning to it. The "
+        "tone should land somewhere between Reel #4's 'Aphrodite scone' voice and a dry aside.",
+    ),
+]
+
+
+def summarize_row_for_prompt(row, full_notes: bool = False):
+    """Format a row for the analyst prompt.
+
+    If full_notes=True (used for the top-3 by avg watch time), include the
+    FULL Notes text and the full Reel Vision Analysis. Julie's hand-written
+    notes on top performers are the highest-signal input — never truncate them.
+    Otherwise use compact summaries."""
     title = read_prop(row, "Title") or "(untitled)"
     cap = read_prop(row, "Caption") or ""
     notes = read_prop(row, "Notes") or ""
@@ -753,18 +814,26 @@ def summarize_row_for_prompt(row):
     views = read_prop(row, "Views")
     reach = read_prop(row, "Reach")
     watch = read_prop(row, "Avg Watch Time") or ""
-    frame = read_prop(row, "First 10s Analysis") or ""
+    frame = read_prop(row, "Reel Vision Analysis") or ""
     metric_str = ""
     if views is not None or reach is not None or watch:
         metric_str = f" [views:{views or '?'} reach:{reach or '?'} watch:{watch or '?'}]"
     parts = [f"Reel #{reel_num} [{hook}/{split}]{metric_str} {title}"]
     if cap:
-        parts.append(f"  Caption: {cap[:200]}")
+        parts.append(f"  Caption: {cap[:300 if full_notes else 200]}")
     if notes:
-        parts.append(f"  Notes: {notes[:300]}")
+        if full_notes:
+            parts.append(f"  Notes (FULL — top performer, high signal):\n    {notes}")
+        else:
+            parts.append(f"  Notes: {notes[:300]}")
     if frame:
-        # Only include first line of frame analysis for the summary
-        parts.append(f"  First 10s: {frame.splitlines()[0] if frame else ''}")
+        if full_notes:
+            # Include the full frame analysis for top performers
+            indented = "\n    ".join(frame.splitlines())
+            parts.append(f"  Full frame analysis:\n    {indented}")
+        else:
+            # Only first line for the rest — keeps token budget in check
+            parts.append(f"  Frame analysis: {frame.splitlines()[0] if frame else ''}")
     return "\n".join(parts)
 
 
@@ -799,16 +868,25 @@ def _call_claude(client, model, prompt, max_tokens):
 
 
 def analyze_context(client, rows, hook_type, content_split, next_reel_num):
-    """Pass 1 — Opus analyst: strategic reasoning over real performance data."""
+    """Pass 1 — Opus analyst: strategic reasoning over real performance data.
+
+    Top-3 performers by avg watch time get their FULL notes + full frame
+    analysis in the prompt. The next ~12 get compact summaries.
+    """
     posted = [r for r in rows if read_prop(r, "Status") == "Posted"]
     # Sort by avg watch time desc so analyst sees top performers first
     posted.sort(key=watch_time_seconds, reverse=True)
     posted = posted[:15]
     scripted = [r for r in rows if read_prop(r, "Status") == "Scripted"][:6]
 
+    # Top 3 get full-fidelity context; everyone else compact
+    past_posted_lines = []
+    for i, r in enumerate(posted):
+        past_posted_lines.append(summarize_row_for_prompt(r, full_notes=(i < 3)))
+
     frame_lines = []
     for r in posted[:8]:
-        fa = read_prop(r, "First 10s Analysis")
+        fa = read_prop(r, "Reel Vision Analysis")
         if fa:
             frame_lines.append(f"Reel #{read_prop(r, 'Reel #')}:\n{fa}")
 
@@ -816,7 +894,7 @@ def analyze_context(client, rows, hook_type, content_split, next_reel_num):
         next_reel_num=next_reel_num,
         hook_type=hook_type,
         content_split=content_split,
-        past_posted="\n".join(summarize_row_for_prompt(r) for r in posted) or "(none yet)",
+        past_posted="\n\n".join(past_posted_lines) or "(none yet)",
         past_scripted="\n".join(summarize_row_for_prompt(r) for r in scripted) or "(none yet)",
         frame_analyses="\n\n".join(frame_lines) or "(no frame analyses yet — vision step may still be running)",
     )
@@ -829,8 +907,32 @@ def analyze_context(client, rows, hook_type, content_split, next_reel_num):
     return brief
 
 
-def write_script(client, brief, hook_type, content_split):
-    """Pass 2 — Sonnet writer: turn the brief into the final reel script JSON."""
+def _enforce_hashtag_cap(data):
+    """Backstop: trim any script's caption to MAX_HASHTAGS hashtags."""
+    caption = data.get("caption", "")
+    tags = re.findall(r"#\w+", caption)
+    if len(tags) <= MAX_HASHTAGS:
+        return data
+    keep = set(tags[:MAX_HASHTAGS])
+
+    def filter_tag(m):
+        return m.group(0) if m.group(0) in keep else ""
+
+    caption = re.sub(r"#\w+", filter_tag, caption)
+    caption = re.sub(r"\s{2,}", " ", caption).strip()
+    missing = [t for t in tags[:MAX_HASHTAGS] if t not in caption]
+    if missing:
+        caption = caption + "\n\n" + " ".join(missing)
+    data["caption"] = caption
+    return data
+
+
+def write_script(client, brief, hook_type, content_split, variation_label, variation_hint):
+    """Pass 2 — Sonnet writer: turn the brief into one reel script variation.
+
+    Called 3x per run with different variation_label/hint to produce a
+    text-forward, a visual-only, and a humor-led variant.
+    """
     suggested = brief.get("suggested_hashtags", [])
     if isinstance(suggested, list):
         suggested_str = ", ".join(suggested)
@@ -845,51 +947,83 @@ def write_script(client, brief, hook_type, content_split):
         mood=brief.get("mood", ""),
         wardrobe_direction=brief.get("wardrobe_direction", "N/A"),
         suggested_hashtags=suggested_str,
+        variation_hint=f"[{variation_label}] {variation_hint}",
         hook_type=hook_type,
         content_split=content_split,
     )
     data = _call_claude(client, WRITER_MODEL, prompt, max_tokens=2000)
-    # Enforce the 5-hashtag cap as a backstop
-    caption = data.get("caption", "")
-    tags = re.findall(r"#\w+", caption)
-    if len(tags) > MAX_HASHTAGS:
-        keep = set(tags[:MAX_HASHTAGS])
-        # Remove any hashtags beyond the first 5
-        def filter_tag(m):
-            return m.group(0) if m.group(0) in keep else ""
-        caption = re.sub(r"#\w+", filter_tag, caption)
-        caption = re.sub(r"\s{2,}", " ", caption).strip()
-        data["caption"] = caption
-        # Re-add the kept tags at the end if they got stripped
-        missing = [t for t in tags[:MAX_HASHTAGS] if t not in caption]
-        if missing:
-            data["caption"] = caption + "\n\n" + " ".join(missing)
-    return data
+    data.setdefault("variation_label", variation_label)
+    return _enforce_hashtag_cap(data)
 
 
-def generate_script(client, rows, hook_type, content_split, next_reel_num):
-    """Two-pass script generation: Opus analyzes, Sonnet writes."""
+def generate_script_variations(client, rows, hook_type, content_split, next_reel_num):
+    """Two-stage pipeline:
+    1. Opus analyst produces one creative brief (shared across all variants).
+    2. Sonnet writer is called 3x with different variation directives,
+       returning (variations_list, brief).
+
+    The main row is written from variations[0] (text-forward), and alts
+    from variations[1] (visual-only) + variations[2] (humor-led) get
+    serialized into the 'Alt Scripts' column as a compact text blob."""
     brief = analyze_context(client, rows, hook_type, content_split, next_reel_num)
-    return write_script(client, brief, hook_type, content_split)
+    variations = []
+    for label, hint in VARIATION_HINTS:
+        print(f"  [writer] variation: {label}", file=sys.stderr)
+        script = write_script(client, brief, hook_type, content_split, label, hint)
+        variations.append(script)
+    return variations, brief
 
 
-def create_script_row(script, hook_type, content_split, reel_num, schema_props):
+def format_alt_scripts(variations):
+    """Serialize the non-main variations (B and C) into a compact text blob
+    for the Alt Scripts column. Julie can read and swap into main content
+    if she prefers one of the alternates."""
+    if len(variations) < 2:
+        return ""
+    lines = []
+    for v in variations[1:]:
+        label = v.get("variation_label", "(unknown)")
+        lines.append(f"=== {label} ===")
+        lines.append(f"Title: {v.get('title','')}")
+        lines.append(f"Clip order:\n{v.get('clip_order','')}")
+        lines.append(f"On-screen text: {v.get('on_screen_text','')}")
+        lines.append(f"Caption:\n{v.get('caption','')}")
+        lines.append(f"Cover scene: {v.get('cover_scene','')}")
+        lines.append(f"Suno: {v.get('suno_prompt','')}")
+        lines.append(f"Transitions: {v.get('transitions','')}")
+        lines.append(f"Notes: {v.get('notes','')}")
+        lines.append("")  # blank line between variations
+    return "\n".join(lines).strip()
+
+
+def create_script_row(variations, hook_type, content_split, reel_num, schema_props):
+    """Create a single Scripted row populated from the first variation, with
+    the other two serialized into the 'Alt Scripts' column for review."""
+    if isinstance(variations, dict):
+        # Backwards-compat: a single script dict was passed
+        variations = [variations]
+    main = variations[0]
+    alts_blob = format_alt_scripts(variations) if len(variations) > 1 else ""
+
     title_prop = next((n for n, p in schema_props.items() if p["type"] == "title"), None)
     updates = {
-        title_prop: script["title"],
+        title_prop: main["title"],
         "Status": "Scripted",
         "Reel #": reel_num,
-        "Clip Order": script["clip_order"],
-        "On-Screen Text": script["on_screen_text"],
-        "Caption": script["caption"],
+        "Clip Order": main["clip_order"],
+        "On-Screen Text": main["on_screen_text"],
+        "Caption": main["caption"],
         "Hook Type": hook_type,
         "Content Split": content_split,
-        "Cover Scene": script["cover_scene"],
-        "Suno Prompt": script["suno_prompt"],
-        "Transitions": script["transitions"],
-        "Reel Total Time": script["reel_total_time"],
-        "Notes": script["notes"],
+        "Cover Scene": main["cover_scene"],
+        "Suno Prompt": main["suno_prompt"],
+        "Transitions": main["transitions"],
+        "Reel Total Time": main["reel_total_time"],
+        "Notes": main["notes"],
     }
+    if alts_blob and "Alt Scripts" in schema_props:
+        updates["Alt Scripts"] = alts_blob
+
     body = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": build_props(schema_props, updates),
@@ -996,16 +1130,17 @@ def main():
                 f"Next reel plan: #{next_reel_num} hook={hook_type} split={content_split}",
                 file=sys.stderr,
             )
-            script = generate_script(
+            variations, _brief = generate_script_variations(
                 anthropic_client, rows, hook_type, content_split, next_reel_num
             )
             new_page = create_script_row(
-                script, hook_type, content_split, next_reel_num, schema_props
+                variations, hook_type, content_split, next_reel_num, schema_props
             )
             summary["new_script_row"] = {
                 "id": new_page["id"],
                 "reel_num": next_reel_num,
-                "title": script["title"],
+                "title": variations[0]["title"],
+                "variation_labels": [v.get("variation_label", "?") for v in variations],
             }
         else:
             today = datetime.now(timezone.utc).strftime("%A")
@@ -1037,6 +1172,8 @@ def main():
     if summary["new_script_row"]:
         nsr = summary["new_script_row"]
         print(f"New script row: Reel #{nsr['reel_num']} — {nsr['title']} ({nsr['id']})")
+        if nsr.get("variation_labels"):
+            print(f"  Variations generated: {', '.join(nsr['variation_labels'])} (main=first, alts in 'Alt Scripts')")
     elif summary["script_gen_skipped"]:
         print("New script row: (skipped — not a script-gen day)")
     else:
