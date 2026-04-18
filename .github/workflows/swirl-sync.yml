@@ -56,4 +56,7 @@ jobs:
           # gh CLI needs auth to update the IG_TOKEN secret on auto-refresh.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # JulzOps ops dashboard ingest. Missing secrets = no-op, never fails the run.
+          JULZOPS_INGEST_URL: ${{ secrets.JULZOPS_INGEST_URL }}
+          JULZOPS_INGEST_SECRET: ${{ secrets.JULZOPS_INGEST_SECRET }}
         run: python sync.py

@@ -38,6 +38,10 @@ IG_USER_ID = os.environ["IG_USER_ID"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID = os.environ["NOTION_DB_ID"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Optional: POST run summary to JulzOps ops dashboard at end of each run.
+# If either env var is missing, the POST is a no-op.
+JULZOPS_INGEST_URL = os.environ.get("JULZOPS_INGEST_URL", "")
+JULZOPS_INGEST_SECRET = os.environ.get("JULZOPS_INGEST_SECRET", "")
 # Two-model setup: Opus reasons over past performance, Sonnet turns the brief
 # into the final reel script JSON, and Sonnet Vision analyzes first-10s frames.
 ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-opus-4-6")
@@ -92,6 +96,77 @@ def check_budget():
         raise RuntimeError(
             f"Run cost ${_run_usage['total_usd']:.4f} reached max ${MAX_COST_PER_RUN_USD:.2f} — aborting."
         )
+
+
+def post_run_to_julzops(summary: dict, started_at: datetime, ended_at: datetime) -> None:
+    """POST run summary to JulzOps ops dashboard. Never raises — failure is
+    logged to stderr and the sync run continues as normal.
+
+    The env vars JULZOPS_INGEST_URL + JULZOPS_INGEST_SECRET must both be set
+    (they are in GH Actions secrets). If either is missing this is a no-op.
+    """
+    if not JULZOPS_INGEST_URL or not JULZOPS_INGEST_SECRET:
+        return
+    try:
+        by_model = {
+            model: {
+                "calls": b["calls"],
+                "inputTokens": b["input_tokens"],
+                "outputTokens": b["output_tokens"],
+                "costUsd": b["cost_usd"],
+            }
+            for model, b in _run_usage["by_model"].items()
+        }
+        status = "failure" if summary.get("errors") else "success"
+        run_url = None
+        repo = os.environ.get("GITHUB_REPOSITORY")
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        if repo and run_id:
+            run_url = f"{server}/{repo}/actions/runs/{run_id}"
+        new_script = summary.get("new_script_row")
+        payload = {
+            "projectSlug": "swirl-series-automation",
+            "source": "github_actions",
+            "workflowTitle": f"Swirl Series sync {started_at.strftime('%Y-%m-%d')}",
+            "startedAt": started_at.isoformat(),
+            "endedAt": ended_at.isoformat(),
+            "durationMs": int((ended_at - started_at).total_seconds() * 1000),
+            "status": status,
+            "runUrl": run_url,
+            "metadata": {
+                "igFetched": summary.get("ig_fetched", 0),
+                "metricsRefreshed": len(summary.get("metrics_refreshed", [])),
+                "promotedToPosted": len(summary.get("promoted_to_posted", [])),
+                "framesAnalyzed": len(summary.get("frames_analyzed", [])),
+                "unmatchedWarnings": len(summary.get("unmatched_warnings", [])),
+                "scriptGenSkipped": summary.get("script_gen_skipped", False),
+                "newScriptRow": {
+                    "reelNum": new_script["reel_num"],
+                    "title": new_script["title"],
+                } if new_script else None,
+                "errors": summary.get("errors", [])[:10],
+            },
+            "usage": {
+                "totalUsd": round(_run_usage["total_usd"], 6),
+                "byModel": by_model,
+            },
+        }
+        r = requests.post(
+            JULZOPS_INGEST_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {JULZOPS_INGEST_SECRET}"},
+            timeout=5,
+        )
+        if r.status_code >= 400:
+            print(
+                f"  [julzops] ingest returned {r.status_code}: {r.text[:200]}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  [julzops] ingest ok: {r.json().get('eventId', '?')}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [julzops] ingest error (non-fatal): {e}", file=sys.stderr)
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -746,7 +821,15 @@ You're planning the NEXT Instagram reel (Reel #{next_reel_num}). A separate writ
 Reel 4 paired Julie pouring latte with Julie doing dev work — a "two-process-in-parallel" format. 11.7s avg watch (~3x everything else), but only 13 reach because she forgot hashtags. Concept is compelling as a recurring series format: brewing ↔ building, morning ritual ↔ code commit, steam wand ↔ terminal typing. Consider proposing variations.
 
 ## Hashtag rule
-Exactly 5 hashtags per caption. No more. Writer will enforce but you should suggest the 5 best ones for this reel's angle in your brief (don't always use the same ones — match to theme).
+Exactly 5 hashtags per caption. No more. Writer will enforce but you should suggest the 5 best ones for this reel's angle in your brief (don't always use the same ones — match to theme). ALWAYS include #swirlie as one of the 5.
+
+## Content rules
+- ALWAYS thread Swirlie into the caption naturally — every reel must mention the app, even pure lifestyle ones. A single sentence is enough ("tracking my progress in Swirlie", "the app is learning too"). Never generate a reel with zero app connection.
+- #swirlie and #buildinginpublic must always be in the 5 hashtags. The other 3 should vary by theme.
+- Content Split should default to App/Lifestyle Blend. Only pick Lifestyle if the concept genuinely has no app angle or Julie has no app footage available. A caption mention of Swirlie is enough to qualify as Blend.
+- Optimize for SAVES and SHARES — currently zero across all reels. Every brief should include at least one save trigger (practical tip, aesthetic reference, educational moment, or a "save for later" worthy shot).
+- Caption ending style: vary between questions, statements, and poetic endings. Questions on roughly 1 in 3 reels, never back-to-back. Check past scripted reels to see what the last one used and pick something different.
+- Audio: recommend trending IG audio over custom Suno beats. Trending lo-fi/acoustic/cozy sounds get algorithmic push that custom beats don't. Include vibe keywords for searching trending sounds.
 
 ## Recent POSTED reels (sorted by avg watch time desc — emulate the top performers)
 {past_posted}
@@ -794,10 +877,14 @@ Suggested hashtags: {suggested_hashtags}
 - Hook Type: {hook_type}
 - Content Split: {content_split}
 - Reel Total Time: 12-18 seconds (shorter end preferred)
-- Caption: exactly 5 hashtags, no more, no less. Use the suggested hashtags from the brief unless you have a strong reason otherwise.
+- Caption: exactly 5 hashtags, no more, no less. ALWAYS include #swirlie and #buildinginpublic. Use the suggested hashtags from the brief for the other 3 unless you have a strong reason otherwise.
 - **Caption voice rule**: Julie writes captions with LOWERCASE sentence starts — deliberate aesthetic, not a typo. "the hour before anything is asked of you" not "The hour...". Proper nouns (Swirlie, place names, brand names), acronyms, and the word "I" still get capitalized normally. Preserve this voice in every caption you generate.
+- **Swirlie threading**: ALWAYS mention Swirlie naturally in the caption. Every reel must have an app connection — even one sentence counts ("tracking my progress in Swirlie"). Never generate a caption with zero app mention.
+- **Caption ending style**: Vary between questions, statements, and poetic endings. Check the brief's suggested approach. Questions roughly 1 in 3 reels, never back-to-back with a previous scripted reel that also ended with a question.
+- **Save trigger**: Include at least one save-worthy moment (practical tip overlay, aesthetic reference shot, educational beat). Zero saves across all posted reels is the biggest engagement gap.
 - NEVER open with an app/product screen (hard rule from Reel 5→6 A/B test)
 - Avoid passive wide shots from behind and black text transition cards (killed retention on Reel 5)
+- **Audio**: For suno_prompt, write "USE TRENDING AUDIO —" first with vibe keywords for searching IG trending sounds, then a fallback Suno generation prompt. Trending lo-fi/acoustic sounds get algorithmic push that custom beats miss.
 
 ## Your job
 Write the full reel script executing the brief under the variation direction above. Match the mood words exactly. If the brief includes wardrobe direction, bake it into the clip descriptions explicitly (what she's wearing, color palette, styling detail).
@@ -1094,6 +1181,7 @@ def should_generate_script_today() -> bool:
 
 # ---- Main ----
 def main():
+    run_started = datetime.now(timezone.utc)
     summary = {
         "ig_fetched": 0,
         "metrics_refreshed": [],
@@ -1236,6 +1324,9 @@ def main():
             f"{b['input_tokens']} in + {b['output_tokens']} out tokens | "
             f"${b['cost_usd']:.4f}"
         )
+
+    # Ship run summary to JulzOps (non-fatal — never blocks exit)
+    post_run_to_julzops(summary, run_started, datetime.now(timezone.utc))
 
     if summary["errors"]:
         print(f"\nErrors: {len(summary['errors'])}")
