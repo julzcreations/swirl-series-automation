@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """Swirl Series content automation.
 
-Runs on Mon/Wed/Sat at 10am America/Chicago (15:00 UTC), 2 days before each
-Mon/Wed/Fri posting slot.
+Runs Mon/Wed/Fri at 11am America/Chicago (16:00 UTC during CDT, 17:00 UTC
+during CST — cron set to 16:00 UTC which is 11am CDT in summer / 10am CST
+in winter). Same days as Julie's posting cadence so each run lands the
+morning of the day she's filming.
 
-Each run does three things:
-1. Refreshes IG metrics on all existing Posted Notion rows (daily-drift values
-   like views/likes/reach/avg_watch_time keep updating for weeks).
-2. Promotes any Scripted row that just got posted to IG → Posted, populating
-   metrics + permalink + post date + IG media ID.
-3. On script-generation days (Mon/Wed/Sat), analyzes recent performance and
-   first-10s frame descriptions, then drafts ONE new Scripted row for the next
-   posting slot.
+Each run does:
+1. Refreshes IG metrics on all existing Posted Notion rows.
+2. New 4-tier matcher (see HARD RULE below) creates Posted rows from
+   observed reality where appropriate, including Posted twins for
+   off-script reels (linked back to their original Scripted plan via
+   Original Plan relation).
+3. Ages out stale Scripted rows: if a Slot Date is more than 7 days in
+   the past with no match, status flips to Skipped.
+4. Frame-extracts + vision-analyzes any Posted row missing analysis.
+5. On script-gen days, drafts ONE new Scripted row for the next posting
+   slot (with Slot Date instead of Reel #).
 
-HARD RULE: the sync never auto-creates rows for IG posts that don't have a
-matching Notion row. Unmatched IG reels get logged as warnings and skipped.
-The only row this script creates is the single generated Scripted row in
-step 3. Every other row must exist in Notion already (authored by Julie).
+HARD RULE (2026-04-19 rewrite): sync DOES create a row for every new IG
+post. Category multi-select differentiates Swirl Series from Other content.
+Match priority:
+  1. Exact IG Media ID  -> refresh metrics on existing row.
+  2. Caption similarity >= 0.85 to a Scripted Swirl-Series row -> flip
+     Scripted to Posted (you posted exactly the plan). Tag Swirl Series,
+     assign next Reel #.
+  3. Slot-position match: IG post date within +/-2 days of an unfilled
+     Scripted Slot Date -> create Posted twin, set Original Plan
+     relation, populate Off-Script Delta. Scripted row left alone as
+     historical record.
+  4. No Swirl Series match -> still create a Posted row, tag Category =
+     Other, no Original Plan, no Reel #.
 
 All credentials come from environment variables. See README.md.
 """
@@ -27,7 +41,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from anthropic import Anthropic
@@ -47,10 +61,33 @@ JULZOPS_INGEST_SECRET = os.environ.get("JULZOPS_INGEST_SECRET", "")
 ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-opus-4-6")
 WRITER_MODEL = os.environ.get("WRITER_MODEL", "claude-sonnet-4-6")
 VISION_MODEL = os.environ.get("VISION_MODEL", "claude-sonnet-4-6")
-# Script generation runs on Sat=5, Mon=0, Wed=2 (Python weekday() numbering).
-SCRIPT_GEN_WEEKDAYS = {0, 2, 5}
-# Allow overriding via env for manual runs / testing.
-FORCE_SCRIPT_GEN = os.environ.get("FORCE_SCRIPT_GEN", "").lower() in ("1", "true", "yes")
+# Script generation runs on Mon=0, Wed=2, Fri=4 (Python weekday() numbering).
+# Aligned to posting cadence so each run drafts that-day's reel.
+SCRIPT_GEN_WEEKDAYS = {0, 2, 4}
+# Allow overriding via env for manual runs / testing. FORCE_REGEN is the
+# canonical name; FORCE_SCRIPT_GEN is kept as an alias for backwards-compat
+# with existing workflow_dispatch invocations.
+FORCE_REGEN = (
+    os.environ.get("FORCE_REGEN", "").lower() in ("1", "true", "yes")
+    or os.environ.get("FORCE_SCRIPT_GEN", "").lower() in ("1", "true", "yes")
+)
+# When set via workflow_dispatch, force-reconcile this specific IG media ID
+# even if it is already matched and Posted. Useful for reprocessing a single
+# off-script reel.
+TARGET_MEDIA_ID = os.environ.get("TARGET_MEDIA_ID", "").strip() or None
+
+# ---- New behavior thresholds (2026-04-19 rewrite) ----
+# Caption similarity >= this means "you posted what we planned" (path 2 match).
+CAPTION_MATCH_THRESHOLD = 0.85
+# Slot-position match window — IG post date within +/- this many days of an
+# unfilled Scripted Slot Date matches that slot.
+SLOT_MATCH_DAYS = 2
+# Scripted rows whose Slot Date is more than this many days in the past with
+# no match get flipped to Skipped (keeps the calendar honest).
+SKIPPED_AGE_DAYS = 7
+# Category options used by the multi-select Category column.
+CATEGORY_SWIRL = "Swirl Series"
+CATEGORY_OTHER = "Other"
 
 # ---- Cost tracking ----
 # Per-million-token pricing in USD, from anthropic.com/pricing (2026).
@@ -138,11 +175,15 @@ def post_run_to_julzops(summary: dict, started_at: datetime, ended_at: datetime)
                 "igFetched": summary.get("ig_fetched", 0),
                 "metricsRefreshed": len(summary.get("metrics_refreshed", [])),
                 "promotedToPosted": len(summary.get("promoted_to_posted", [])),
+                "twinsCreated": len(summary.get("twins_created", [])),
+                "othersCreated": len(summary.get("others_created", [])),
+                "agedOutToSkipped": len(summary.get("aged_out_to_skipped", [])),
                 "framesAnalyzed": len(summary.get("frames_analyzed", [])),
                 "unmatchedWarnings": len(summary.get("unmatched_warnings", [])),
                 "scriptGenSkipped": summary.get("script_gen_skipped", False),
                 "newScriptRow": {
                     "reelNum": new_script["reel_num"],
+                    "slotDate": new_script.get("slot_date"),
                     "title": new_script["title"],
                 } if new_script else None,
                 "errors": summary.get("errors", [])[:10],
@@ -416,9 +457,27 @@ def build_props(schema_props: dict, updates: dict) -> dict:
     return out
 
 
-# ---- Matching: IG Media ID first, fuzzy caption fallback ----
+# ---- Category helpers (multi-select Category column added 2026-04-19) ----
+def read_category(row) -> list:
+    """Return the row's Category multi-select values as a list of strings."""
+    val = read_prop(row, "Category")
+    if not val:
+        return []
+    return val if isinstance(val, list) else [val]
+
+
+def is_swirl_series(row) -> bool:
+    return CATEGORY_SWIRL in read_category(row)
+
+
+def row_slot_date(page) -> "datetime | None":
+    v = read_prop(page, "Slot Date")
+    return parse_ts(v) if v else None
+
+
+# ---- Matching: 4-tier algorithm (2026-04-19 rewrite) ----
 def match_by_media_id(reel_id, rows):
-    """Exact match on the IG Media ID column. Rock solid, no false positives."""
+    """Path 1: exact match on the IG Media ID column. Rock solid, no false positives."""
     for row in rows:
         row_id = read_prop(row, "IG Media ID")
         if row_id and str(row_id).strip() == str(reel_id).strip():
@@ -427,6 +486,7 @@ def match_by_media_id(reel_id, rows):
 
 
 def row_posted_date(page, schema_props):
+    """Read the row's Post Date column (handles legacy aliases)."""
     for field in ("Posted Date", "Post Date", "Date", "Posted", "Scheduled Date"):
         if field in schema_props:
             v = read_prop(page, field)
@@ -435,87 +495,136 @@ def row_posted_date(page, schema_props):
     return None
 
 
-def match_by_fuzzy_caption(reel, rows, schema_props, threshold=0.85):
-    """Fuzzy caption match — fallback for rows that don't have an IG Media ID yet.
-
-    Threshold tightened to 0.85 (was 0.7) to eliminate false positives caught
-    after Reel 5 double-matched on the loose setting.
-    """
+def caption_similarity(reel, row) -> float:
+    """SequenceMatcher ratio between IG caption and row caption/title (0-1)."""
     reel_cap = caption_key(reel.get("caption", ""))
-    reel_ts = parse_ts(reel.get("timestamp"))
+    if not reel_cap:
+        return 0.0
+    row_cap = ""
+    for field in ("Caption", "Title"):
+        v = read_prop(row, field)
+        if v:
+            row_cap = caption_key(v)
+            if row_cap:
+                break
+    if not row_cap:
+        return 0.0
+    return difflib.SequenceMatcher(None, reel_cap, row_cap).ratio()
+
+
+def match_by_caption_similarity(reel, candidates):
+    """Path 2: high-confidence caption match (>= CAPTION_MATCH_THRESHOLD)
+    against an unmatched Scripted row. Returns (row, score) or (None, 0.0).
+    Considers only rows without an IG Media ID (Path 1 already handled those)."""
     best = None
     best_score = 0.0
-    for row in rows:
-        # Skip rows that already have an IG Media ID — they should have matched
-        # in the exact pass. If they didn't, they belong to a different reel.
+    for row in candidates:
         if read_prop(row, "IG Media ID"):
             continue
-        row_cap = ""
-        for field in ("Caption", "Title"):
-            v = read_prop(row, field)
-            if v:
-                row_cap = caption_key(v)
-                if row_cap:
-                    break
-        if reel_cap and row_cap:
-            score = difflib.SequenceMatcher(None, reel_cap, row_cap).ratio()
-            if score >= threshold and score > best_score:
-                best_score = score
-                best = row
-        if reel_ts and best_score < 0.95:
-            rd = row_posted_date(row, schema_props)
-            if rd and abs((rd - reel_ts).days) <= 2:
-                if best is None:
-                    best = row
-                    best_score = 0.85
+        if read_prop(row, "Status") != "Scripted":
+            continue
+        if not is_swirl_series(row):
+            continue
+        score = caption_similarity(reel, row)
+        if score >= CAPTION_MATCH_THRESHOLD and score > best_score:
+            best_score = score
+            best = row
+    return best, best_score
+
+
+def match_by_slot_position(reel, candidates, claimed_ids: set):
+    """Path 3: slot-position match. IG post date within +/- SLOT_MATCH_DAYS
+    of an unfilled Scripted Slot Date and that slot has not already been
+    claimed in this run. Caption is presumed to NOT match (handled by Path 2
+    upstream) — anything reaching Path 3 has diverged enough to be off-script.
+
+    Returns the matched Scripted row or None.
+    """
+    reel_ts = parse_ts(reel.get("timestamp"))
+    if not reel_ts:
+        return None
+    best = None
+    best_distance = None
+    for row in candidates:
+        if row["id"] in claimed_ids:
+            continue
+        if read_prop(row, "IG Media ID"):
+            continue
+        if read_prop(row, "Status") != "Scripted":
+            continue
+        if not is_swirl_series(row):
+            continue
+        slot = row_slot_date(row)
+        if not slot:
+            continue
+        distance = abs((slot - reel_ts).days)
+        if distance <= SLOT_MATCH_DAYS and (best_distance is None or distance < best_distance):
+            best = row
+            best_distance = distance
     return best
 
 
 def is_reel_row(row) -> bool:
-    """Filter out non-reel pages (e.g. 'Asset library') from matching."""
+    """Filter out clearly-not-reel pages (e.g. 'Asset library') from matching."""
     if read_prop(row, "Reel #") is not None:
         return True
-    if read_prop(row, "Status") in ("Posted", "Scripted"):
+    if read_prop(row, "Status") in ("Posted", "Scripted", "Skipped"):
+        return True
+    if read_category(row):
         return True
     title = (read_prop(row, "Title") or "").lower()
     return title.startswith("reel ")
 
 
 def reconcile(reels, rows, schema_props):
-    """Match each IG reel to an existing row. Two-bucket outcome:
+    """4-tier match algorithm. Returns four buckets:
 
-    - refreshes: already-Posted rows that need metric updates
-    - promotes: Scripted rows that just got posted → flip to Posted
+    - refreshes:  list of (page_id, reel) — Path 1, refresh metrics on existing row
+    - promotes:   list of (page_id, reel) — Path 2, flip Scripted to Posted
+    - twins:      list of (scripted_row, reel) — Path 3, create Posted twin
+                  with Original Plan relation back to the Scripted row
+    - others:     list of reel — Path 4, create a Posted row tagged Other
+                  (non-Swirl-Series content captured for analytics)
 
-    Unmatched IG reels are LOGGED as warnings and skipped. The sync never
-    creates rows for unmatched posts.
+    Differs from the pre-2026-04-19 version:
+    - Off-script reels no longer corrupt the Scripted row's structured fields.
+    - Sync now creates rows for non-Swirl posts (tagged Other) instead of
+      logging-and-skipping.
     """
     refreshes = []
     promotes = []
-    unmatched = []
-    reel_candidates = [r for r in rows if is_reel_row(r)]
+    twins = []
+    others = []
+    candidates = [r for r in rows if is_reel_row(r)]
+    # Track Scripted row ids that have been claimed within THIS run so two
+    # IG reels can't both match the same Scripted slot.
+    claimed_scripted_ids: set = set()
+
     for reel in reels:
-        # Exact ID match first
-        match = match_by_media_id(reel["id"], reel_candidates)
-        # Fuzzy fallback for rows that don't have an IG Media ID yet
-        if match is None:
-            match = match_by_fuzzy_caption(reel, reel_candidates, schema_props)
-        if match is None:
-            unmatched.append(reel)
-            continue
-        status = read_prop(match, "Status")
-        notes = read_prop(match, "Notes") or ""
-        if status == "Scripted" and notes and "REGENERATE" not in notes and read_prop(match, "Clip Order"):
-            # Protected: user has authored content on this Scripted row.
-            # Still flip to Posted because the reel IS live — just don't touch
-            # the creative fields.
-            promotes.append((match["id"], reel))
-            continue
-        if status == "Posted":
+        # Path 1: exact IG Media ID match -> refresh
+        match = match_by_media_id(reel["id"], candidates)
+        if match is not None:
             refreshes.append((match["id"], reel))
-        else:
-            promotes.append((match["id"], reel))
-    return refreshes, promotes, unmatched
+            continue
+
+        # Path 2: high-confidence caption similarity to a Scripted row -> promote
+        cap_match, cap_score = match_by_caption_similarity(reel, candidates)
+        if cap_match is not None:
+            promotes.append((cap_match["id"], reel))
+            claimed_scripted_ids.add(cap_match["id"])
+            continue
+
+        # Path 3: slot-position match -> create Posted twin
+        slot_match = match_by_slot_position(reel, candidates, claimed_scripted_ids)
+        if slot_match is not None:
+            twins.append((slot_match, reel))
+            claimed_scripted_ids.add(slot_match["id"])
+            continue
+
+        # Path 4: no Swirl Series match -> Other
+        others.append(reel)
+
+    return refreshes, promotes, twins, others
 
 
 # ---- Update builders ----
@@ -573,13 +682,257 @@ def refresh_row_metrics(page_id, reel, schema_props):
     return _patch_row(page_id, {"properties": build_props(schema_props, updates)})
 
 
-def promote_row_to_posted(page_id, reel, schema_props):
-    """Flip a row to Posted and populate metrics/permalink/post date/IG ID."""
+def promote_row_to_posted(page_id, reel, schema_props, reel_num: int):
+    """Flip a Scripted row to Posted (Path 2 match — caption matched the plan).
+    Tags Category = Swirl Series and assigns the next sequential Reel #.
+    Does NOT touch creative fields — the human authored those and the post
+    matches the plan, so they stay as-is."""
     updates = {"Status": "Posted"}
+    if "Category" in schema_props:
+        updates["Category"] = [CATEGORY_SWIRL]
+    if "Reel #" in schema_props:
+        updates["Reel #"] = reel_num
     updates.update(_metric_updates(reel, schema_props))
     updates.update(_permalink_updates(reel, schema_props))
     updates.update(_post_date_updates(reel, schema_props))
     return _patch_row(page_id, {"properties": build_props(schema_props, updates)})
+
+
+# ---- New row creation: Posted twins (Path 3) and Other rows (Path 4) ----
+def _short_caption_title(caption: str, n_words: int) -> str:
+    """First N words of a caption, sentence-cased for a clean title."""
+    words = (caption or "").strip().split()[:n_words]
+    if not words:
+        return "(untitled IG post)"
+    s = " ".join(words)
+    return s[:1].upper() + s[1:] if s else s
+
+
+def create_posted_row(
+    reel,
+    schema_props,
+    category: str,
+    *,
+    original_plan_id: "str | None" = None,
+    off_script_delta: "str | None" = None,
+    reel_num: "int | None" = None,
+):
+    """Create a brand-new Posted row from observed IG data only.
+
+    Used by Path 3 (Posted twin for off-script reel) and Path 4 (Other
+    category for non-Swirl-Series posts). Never copies content from a
+    Scripted row — observed reality only. Vision Analysis is filled in
+    later by the frame-extraction pass.
+    """
+    title_prop = next((n for n, p in schema_props.items() if p["type"] == "title"), None)
+    if not title_prop:
+        raise RuntimeError("No title property found in schema")
+
+    caption = reel.get("caption", "") or ""
+    if category == CATEGORY_SWIRL:
+        title = "[Off-Script] " + _short_caption_title(caption, 4)
+    else:
+        title = _short_caption_title(caption, 6)
+
+    updates = {
+        title_prop: title,
+        "Status": "Posted",
+    }
+    if "Category" in schema_props:
+        updates["Category"] = [category]
+    if reel_num is not None and "Reel #" in schema_props:
+        updates["Reel #"] = reel_num
+    if caption:
+        updates["Caption"] = caption
+        # Parse hashtags out of the caption into the Hashtags column for
+        # consistency with Scripted rows.
+        tags = re.findall(r"#\w+", caption)
+        if tags and "Hashtags" in schema_props:
+            updates["Hashtags"] = " ".join(tags)
+    if "Soundtrack" in schema_props:
+        updates["Soundtrack"] = "(audio not derivable from frames \u2014 fill in manually if known)"
+    if off_script_delta and "Off-Script Delta" in schema_props:
+        updates["Off-Script Delta"] = off_script_delta
+    if "Notes" in schema_props:
+        if category == CATEGORY_SWIRL:
+            note = (
+                f"Reconciled from IG observation {datetime.now(timezone.utc).date().isoformat()}. "
+                f"Posted twin for an off-script reel. Original Plan relation points to the Scripted "
+                f"row that was the original plan for this slot."
+            )
+        else:
+            note = (
+                f"Auto-created from IG on {datetime.now(timezone.utc).date().isoformat()} "
+                f"because no Swirl Series Scripted row matched. Tagged Other for analytics. "
+                f"Reclassify Category if this should be Swirl Series."
+            )
+        updates["Notes"] = note
+
+    updates.update(_metric_updates(reel, schema_props))
+    updates.update(_permalink_updates(reel, schema_props))
+    updates.update(_post_date_updates(reel, schema_props))
+
+    body = {
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": build_props(schema_props, updates),
+    }
+    # Original Plan is a relation type — write_prop doesn't handle relation,
+    # so we add it directly to the properties dict.
+    if original_plan_id and "Original Plan" in schema_props:
+        body["properties"]["Original Plan"] = {"relation": [{"id": original_plan_id}]}
+
+    r = requests.post(
+        "https://api.notion.com/v1/pages",
+        headers=NOTION_HEADERS, json=body, timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+# ---- Off-Script Delta computation ----
+OFF_SCRIPT_DELTA_PROMPT = """You are reconciling a Swirl Series Instagram reel that was filmed off-script. The original plan and the actually-posted content are below. Write a single short paragraph (2-4 sentences) describing how the post diverged from the plan. Be concrete and specific.
+
+Cover any of these axes that changed:
+- Subject / topic (what the reel is "about")
+- Voice / tone (cozy, playful, narrative, etc.)
+- Hook type
+- Wardrobe / setting
+- Length / pacing
+- Content split (App/Lifestyle Blend vs Lifestyle)
+- On-screen text presence
+
+If something matches between plan and post, you can briefly note that too.
+
+PLANNED (Scripted row):
+- Title: {plan_title}
+- Caption: {plan_caption}
+- Clip Order: {plan_clip_order}
+- On-Screen Text: {plan_ost}
+- Hook Type: {plan_hook}
+- Content Split: {plan_split}
+- Notes: {plan_notes}
+
+POSTED (actual IG reel):
+- Caption: {posted_caption}
+- Post Date: {posted_date}
+
+Return ONLY the paragraph, no headings, no JSON, no quotes around it."""
+
+
+def compute_off_script_delta(client, scripted_row, reel) -> str:
+    """One Claude call per off-script reel. Compares the planned Scripted row
+    against the observed IG reel and returns a short structured description."""
+    plan_caption = (read_prop(scripted_row, "Caption") or "")[:500]
+    plan_clip_order = (read_prop(scripted_row, "Clip Order") or "")[:500]
+    plan_ost = (read_prop(scripted_row, "On-Screen Text") or "")[:300]
+    plan_hook = read_prop(scripted_row, "Hook Type") or ""
+    plan_split = read_prop(scripted_row, "Content Split") or ""
+    plan_title = read_prop(scripted_row, "Title") or "(untitled)"
+    plan_notes = (read_prop(scripted_row, "Notes") or "")[:400]
+    posted_caption = (reel.get("caption", "") or "")[:500]
+    posted_date = (reel.get("timestamp", "") or "")[:10]
+    prompt = OFF_SCRIPT_DELTA_PROMPT.format(
+        plan_title=plan_title,
+        plan_caption=plan_caption or "(none)",
+        plan_clip_order=plan_clip_order or "(none)",
+        plan_ost=plan_ost or "(none)",
+        plan_hook=plan_hook or "(none)",
+        plan_split=plan_split or "(none)",
+        plan_notes=plan_notes or "(none)",
+        posted_caption=posted_caption or "(none)",
+        posted_date=posted_date or "(unknown)",
+    )
+    try:
+        check_budget()
+        msg = client.messages.create(
+            model=WRITER_MODEL,  # Sonnet is plenty for this — short, structured
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        usage = getattr(msg, "usage", None)
+        if usage is not None:
+            cost = track_usage(WRITER_MODEL, usage.input_tokens, usage.output_tokens)
+            print(
+                f"  [cost] {WRITER_MODEL} (off-script delta): "
+                f"{usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
+                file=sys.stderr,
+            )
+        text = "".join(b.text for b in msg.content if b.type == "text").strip()
+        return text[:1500]  # cap to a reasonable length
+    except Exception as e:
+        print(f"  [warn] off-script delta computation failed: {e}", file=sys.stderr)
+        return f"(automatic delta unavailable: {e})"
+
+
+# ---- Reel # accounting (Swirl Series only) ----
+def next_swirl_reel_number(rows) -> int:
+    """Highest Reel # among Posted Swirl Series rows, plus 1.
+    Reel # is no longer assigned to Scripted rows or Other-tagged rows."""
+    n = 0
+    for row in rows:
+        if read_prop(row, "Status") != "Posted":
+            continue
+        if not is_swirl_series(row):
+            continue
+        v = read_prop(row, "Reel #")
+        if isinstance(v, (int, float)) and v > n:
+            n = int(v)
+    return n + 1
+
+
+# ---- Aging: Slot Date > SKIPPED_AGE_DAYS in past with no match -> Skipped ----
+def age_out_scripted_rows(rows, schema_props) -> list:
+    """Flip Scripted rows whose Slot Date is more than SKIPPED_AGE_DAYS in
+    the past to Status=Skipped. Keeps the calendar honest without losing
+    the suggestion. Returns list of page ids that were aged out."""
+    if "Slot Date" not in schema_props:
+        return []
+    today = datetime.now(timezone.utc).date()
+    aged = []
+    for row in rows:
+        if read_prop(row, "Status") != "Scripted":
+            continue
+        slot = read_prop(row, "Slot Date")
+        if not slot:
+            continue
+        try:
+            slot_date = datetime.fromisoformat(slot[:10]).date()
+        except Exception:
+            continue
+        days_past = (today - slot_date).days
+        if days_past <= SKIPPED_AGE_DAYS:
+            continue
+        try:
+            _patch_row(
+                row["id"],
+                {"properties": build_props(schema_props, {"Status": "Skipped"})},
+            )
+            aged.append(row["id"])
+        except Exception as e:
+            print(f"  [warn] failed to age out {row['id']}: {e}", file=sys.stderr)
+    return aged
+
+
+# ---- Slot Date computation for new Scripted rows ----
+def next_open_slot_date(rows) -> str:
+    """Find the next Mon/Wed/Fri slot date that doesn't already have a
+    Scripted row claiming it. Returns ISO date string (YYYY-MM-DD)."""
+    claimed: set = set()
+    for row in rows:
+        if read_prop(row, "Status") != "Scripted":
+            continue
+        slot = read_prop(row, "Slot Date")
+        if slot:
+            claimed.add(slot[:10])
+    today = datetime.now(timezone.utc).date()
+    candidate = today
+    # Walk forward day by day, find next M/W/F not in `claimed`.
+    for _ in range(60):  # 60-day search horizon is plenty
+        if candidate.weekday() in {0, 2, 4} and candidate.isoformat() not in claimed:
+            return candidate.isoformat()
+        candidate = candidate + timedelta(days=1)
+    # Fallback: today + 1 (shouldn't reach this in practice)
+    return (today + timedelta(days=1)).isoformat()
 
 
 # ---- Frame extraction + vision analysis ----
@@ -761,10 +1114,12 @@ def analyze_reel_frames_if_needed(client, row, reel, schema_props):
     return True
 
 
-# ---- Rotation helpers ----
+# ---- Rotation helpers (Swirl Series only) ----
 def pick_next_hook(rows):
+    """Pick a hook type that hasn't been used in the last 6 Swirl Series rows."""
+    swirl_rows = [r for r in rows if is_swirl_series(r)]
     recent = []
-    for row in rows[:6]:
+    for row in swirl_rows[:6]:
         h = read_prop(row, "Hook Type")
         if h:
             recent.append(h)
@@ -778,31 +1133,26 @@ def pick_next_hook(rows):
 
 
 def pick_next_split(rows):
+    """Pick the Content Split that's behind in the Swirl Series catalog."""
     counts = {s: 0 for s in CONTENT_SPLITS}
     for row in rows:
+        if not is_swirl_series(row):
+            continue
         s = read_prop(row, "Content Split")
         if s in counts:
             counts[s] += 1
     return min(counts, key=counts.get)
 
 
-def max_reel_number(rows):
-    n = 0
-    for row in rows:
-        v = read_prop(row, "Reel #")
-        if isinstance(v, (int, float)) and v > n:
-            n = int(v)
-    return n
-
-
 # ---- Prompts ----
 ANALYST_PROMPT = """You are the creative strategist for Swirlie, an indie latte art practice app. Brand voice: hand-drawn chalk-coffee-shop aesthetic, cozy, intentional, warm — quiet morning ritual meets indie coffee shop chalkboard.
 
-You're planning the NEXT Instagram reel (Reel #{next_reel_num}). A separate writer will turn your brief into the actual script, so your job is JUDGMENT, not prose. Reason over real performance data and hand the writer a specific direction.
+You're planning the NEXT Swirl Series Instagram reel (will be assigned Reel #{next_reel_num} once posted). A separate writer will turn your brief into the actual script, so your job is JUDGMENT, not prose. Reason over real performance data and hand the writer a specific direction.
 
 ## Fixed constraints for the next reel (chosen by rotation logic)
 - Hook Type: {hook_type}
 - Content Split: {content_split}
+- Slot Date (planned post date): {slot_date}
 
 ## Audience strategy (important)
 - TODAY: primarily coffee community, with Swirlie app/dev as a SIDE narrative
@@ -816,6 +1166,9 @@ You're planning the NEXT Instagram reel (Reel #{next_reel_num}). A separate writ
 3. **NEVER open with an app/product screen.** Hard rule — Reel 5→6 A/B test proved this dropped retention 71%. App content only as middle-beat texture.
 4. **Avoid passive openers** (wide shots from behind, black text transition cards). Reel 5's notes explicitly flagged these.
 5. **12-18s target reel length.** Shorter reels held retention better in the data.
+
+## Off-script divergence patterns (NEW signal as of 2026-04-19)
+Some Posted rows below have an `Off-Script Delta` line — this means Julie filmed something different from what was originally planned for that slot. Treat divergence as STRONG signal: when she diverges from a script, what she actually films usually outperforms the plan (her improvisation reflects what she actually wants to make). Look for patterns across multiple Off-Script Deltas — if she keeps dropping app content, shortening reels, or shifting subject in a particular direction, future scripts should bake those tendencies in upfront.
 
 ## Reel 4 parallel concept (worth iterating)
 Reel 4 paired Julie pouring latte with Julie doing dev work — a "two-process-in-parallel" format. 11.7s avg watch (~3x everything else), but only 13 reach because she forgot hashtags. Concept is compelling as a recurring series format: brewing ↔ building, morning ritual ↔ code commit, steam wand ↔ terminal typing. Consider proposing variations.
@@ -831,11 +1184,14 @@ Exactly 5 hashtags per caption. No more. Writer will enforce but you should sugg
 - Caption ending style: vary between questions, statements, and poetic endings. Questions on roughly 1 in 3 reels, never back-to-back. Check past scripted reels to see what the last one used and pick something different.
 - Audio: recommend trending IG audio over custom Suno beats. Trending lo-fi/acoustic/cozy sounds get algorithmic push that custom beats don't. Include vibe keywords for searching trending sounds.
 
-## Recent POSTED reels (sorted by avg watch time desc — emulate the top performers)
+## Recent POSTED Swirl Series reels (sorted by avg watch time desc — emulate the top performers)
 {past_posted}
 
-## Recent SCRIPTED reels (avoid duplicating these ideas)
+## Recent SCRIPTED Swirl Series reels (avoid duplicating these ideas)
 {past_scripted}
+
+## Recent OTHER posts (non-Swirl IG content for cross-category awareness)
+{other_posts}
 
 ## Recent first-10s frame analyses (for retention pattern learning)
 {frame_analyses}
@@ -878,25 +1234,28 @@ Suggested hashtags: {suggested_hashtags}
 - Content Split: {content_split}
 - Reel Total Time: 12-18 seconds (shorter end preferred)
 - Caption: exactly 5 hashtags, no more, no less. ALWAYS include #swirlie and #buildinginpublic. Use the suggested hashtags from the brief for the other 3 unless you have a strong reason otherwise.
-- **Caption voice rule**: Julie writes captions with LOWERCASE sentence starts — deliberate aesthetic, not a typo. "the hour before anything is asked of you" not "The hour...". Proper nouns (Swirlie, place names, brand names), acronyms, and the word "I" still get capitalized normally. Preserve this voice in every caption you generate.
+- **Capitalization rule (UPDATED 2026-04-19)**: Use proper sentence case in BOTH the title AND the caption. First letter capitalized, "I" always capitalized as a pronoun, proper nouns (Swirlie, Ginger, place names, brand names) capitalized, acronyms capitalized. Casual conversational tone is fine, but capitalization is standard. The earlier "lowercase sentence starts" rule was wrong — Julie's actually-posted captions use sentence case ("The swirl never looks right.", "Survived week 1!", "Couldn't figure out the pour..."). Do NOT default to all-lowercase.
 - **Swirlie threading**: ALWAYS mention Swirlie naturally in the caption. Every reel must have an app connection — even one sentence counts ("tracking my progress in Swirlie"). Never generate a caption with zero app mention.
 - **Caption ending style**: Vary between questions, statements, and poetic endings. Check the brief's suggested approach. Questions roughly 1 in 3 reels, never back-to-back with a previous scripted reel that also ended with a question.
 - **Save trigger**: Include at least one save-worthy moment (practical tip overlay, aesthetic reference shot, educational beat). Zero saves across all posted reels is the biggest engagement gap.
 - NEVER open with an app/product screen (hard rule from Reel 5→6 A/B test)
 - Avoid passive wide shots from behind and black text transition cards (killed retention on Reel 5)
-- **Audio**: For suno_prompt, write "USE TRENDING AUDIO —" first with vibe keywords for searching IG trending sounds, then a fallback Suno generation prompt. Trending lo-fi/acoustic sounds get algorithmic push that custom beats miss.
+- **Soundtrack format (renamed from Suno Prompt)**: Pick EITHER an IG trending audio direction OR a Suno generation prompt — whichever fits the reel's energy. Format the value with an explicit prefix:
+  - `IG TRENDING: search "<terms>" — reference accounts: @x, @y, @z. Use if you find a sound with momentum.`
+  - `SUNO: <full prompt with BPM, instruments, vibe>`
+  - Default to IG trending for high-movement / dance-coded reels; Suno for ambient / narrative / aesthetic-stillness reels. Trending audio gets algorithmic push that custom beats miss.
 
 ## Your job
 Write the full reel script executing the brief under the variation direction above. Match the mood words exactly. If the brief includes wardrobe direction, bake it into the clip descriptions explicitly (what she's wearing, color palette, styling detail).
 
 Return ONLY a JSON object with these exact keys:
 {{
-  "title": "short evocative title — DO NOT prefix with 'Reel N —'",
+  "title": "short evocative title in sentence case — DO NOT prefix with 'Reel N —', DO NOT use all-lowercase",
   "clip_order": "1. First clip description with specific visual + what Julie is wearing/doing (1-2 sentences each)\\n2. Second clip...\\n(5-8 clips total, weighted toward the first 3 seconds)",
-  "on_screen_text": "Overlay 1 | Overlay 2 | Overlay 3 (3-5 short phrases, max ~6 words each)",
-  "caption": "warm conversational caption ending with EXACTLY 5 hashtags",
+  "on_screen_text": "Overlay 1 | Overlay 2 | Overlay 3 (3-5 short phrases, max ~6 words each — these appear ON the video and may use stylistic lowercase if it fits the chalk aesthetic)",
+  "caption": "warm conversational caption in proper sentence case, ending with EXACTLY 5 hashtags",
   "cover_scene": "one sentence describing the thumbnail moment — must be human-first or close-up, never an app screen",
-  "suno_prompt": "lo-fi acoustic cozy music direction",
+  "soundtrack": "either 'IG TRENDING: ...' or 'SUNO: ...' per the Soundtrack format rule above",
   "transitions": "brief notes on cuts / match cuts / whip pans — avoid black text cards",
   "reel_total_time": "14s",
   "notes": "2-3 sentence rationale. MUST begin by citing the theme and the past reels named in 'informed_by', then state the specific hypothesis this reel is testing.",
@@ -936,23 +1295,34 @@ def summarize_row_for_prompt(row, full_notes: bool = False):
     If full_notes=True (used for the top-3 by avg watch time), include the
     FULL Notes text and the full Reel Vision Analysis. Julie's hand-written
     notes on top performers are the highest-signal input — never truncate them.
-    Otherwise use compact summaries."""
+    Otherwise use compact summaries.
+
+    Off-Script Delta (when present) is always surfaced — it's a load-bearing
+    signal about how Julie's actual filming diverges from generated plans.
+    Slot Date is shown for Scripted rows so the analyst knows the timing.
+    """
     title = read_prop(row, "Title") or "(untitled)"
     cap = read_prop(row, "Caption") or ""
     notes = read_prop(row, "Notes") or ""
     reel_num = read_prop(row, "Reel #")
     hook = read_prop(row, "Hook Type") or ""
     split = read_prop(row, "Content Split") or ""
+    status = read_prop(row, "Status") or ""
     views = read_prop(row, "Views")
     reach = read_prop(row, "Reach")
     watch = read_prop(row, "Avg Watch Time") or ""
     frame = read_prop(row, "Reel Vision Analysis") or ""
+    delta = read_prop(row, "Off-Script Delta") or ""
+    slot = read_prop(row, "Slot Date") or ""
     metric_str = ""
     if views is not None or reach is not None or watch:
         metric_str = f" [views:{views or '?'} reach:{reach or '?'} watch:{watch or '?'}]"
-    parts = [f"Reel #{reel_num} [{hook}/{split}]{metric_str} {title}"]
+    id_str = f"Reel #{reel_num}" if reel_num else (f"Slot {slot[:10]}" if slot else "Scripted")
+    parts = [f"{id_str} [{status} {hook}/{split}]{metric_str} {title}"]
     if cap:
         parts.append(f"  Caption: {cap[:300 if full_notes else 200]}")
+    if delta:
+        parts.append(f"  Off-Script Delta: {delta[:400]}")
     if notes:
         if full_notes:
             parts.append(f"  Notes (FULL — top performer, high signal):\n    {notes}")
@@ -999,17 +1369,24 @@ def _call_claude(client, model, prompt, max_tokens):
     return json.loads(text)
 
 
-def analyze_context(client, rows, hook_type, content_split, next_reel_num):
+def analyze_context(client, rows, hook_type, content_split, next_reel_num, slot_date):
     """Pass 1 — Opus analyst: strategic reasoning over real performance data.
 
-    Top-3 performers by avg watch time get their FULL notes + full frame
-    analysis in the prompt. The next ~12 get compact summaries.
+    Filters Swirl Series rows for the script-gen reasoning loop. Surfaces a
+    small sample of Other-tagged rows for cross-category awareness. Top-3
+    Swirl performers by avg watch time get their FULL notes + full frame
+    analysis. The next ~12 get compact summaries.
     """
-    posted = [r for r in rows if read_prop(r, "Status") == "Posted"]
+    swirl_rows = [r for r in rows if is_swirl_series(r)]
+    posted = [r for r in swirl_rows if read_prop(r, "Status") == "Posted"]
     # Sort by avg watch time desc so analyst sees top performers first
     posted.sort(key=watch_time_seconds, reverse=True)
     posted = posted[:15]
-    scripted = [r for r in rows if read_prop(r, "Status") == "Scripted"][:6]
+    scripted = [r for r in swirl_rows if read_prop(r, "Status") == "Scripted"][:6]
+    other_posts = [
+        r for r in rows
+        if not is_swirl_series(r) and read_prop(r, "Status") == "Posted"
+    ][:5]
 
     # Top 3 get full-fidelity context; everyone else compact
     past_posted_lines = []
@@ -1022,12 +1399,22 @@ def analyze_context(client, rows, hook_type, content_split, next_reel_num):
         if fa:
             frame_lines.append(f"Reel #{read_prop(r, 'Reel #')}:\n{fa}")
 
+    other_lines = []
+    for r in other_posts:
+        title = read_prop(r, "Title") or "(untitled)"
+        cap = (read_prop(r, "Caption") or "")[:160]
+        watch = read_prop(r, "Avg Watch Time") or ""
+        reach = read_prop(r, "Reach")
+        other_lines.append(f"- {title} [reach:{reach or '?'} watch:{watch or '?'}] {cap}")
+
     prompt = ANALYST_PROMPT.format(
         next_reel_num=next_reel_num,
+        slot_date=slot_date,
         hook_type=hook_type,
         content_split=content_split,
         past_posted="\n\n".join(past_posted_lines) or "(none yet)",
         past_scripted="\n".join(summarize_row_for_prompt(r) for r in scripted) or "(none yet)",
+        other_posts="\n".join(other_lines) or "(none)",
         frame_analyses="\n\n".join(frame_lines) or "(no frame analyses yet — vision step may still be running)",
     )
     brief = _call_claude(client, ANALYST_MODEL, prompt, max_tokens=900)
@@ -1088,7 +1475,7 @@ def write_script(client, brief, hook_type, content_split, variation_label, varia
     return _enforce_hashtag_cap(data)
 
 
-def generate_script_variations(client, rows, hook_type, content_split, next_reel_num):
+def generate_script_variations(client, rows, hook_type, content_split, next_reel_num, slot_date):
     """Two-stage pipeline:
     1. Opus analyst produces one creative brief (shared across all variants).
     2. Sonnet writer is called 3x with different variation directives,
@@ -1096,8 +1483,13 @@ def generate_script_variations(client, rows, hook_type, content_split, next_reel
 
     The main row is written from variations[0] (text-forward), and alts
     from variations[1] (visual-only) + variations[2] (humor-led) get
-    serialized into the 'Alt Scripts' column as a compact text blob."""
-    brief = analyze_context(client, rows, hook_type, content_split, next_reel_num)
+    serialized into the 'Alt Scripts' column as a compact text blob.
+
+    next_reel_num is passed to the analyst for context (the Reel # the
+    next-posted Swirl Series reel will receive). slot_date is the planned
+    posting date for the Scripted row being generated.
+    """
+    brief = analyze_context(client, rows, hook_type, content_split, next_reel_num, slot_date)
     variations = []
     for label, hint in VARIATION_HINTS:
         print(f"  [writer] variation: {label}", file=sys.stderr)
@@ -1121,16 +1513,23 @@ def format_alt_scripts(variations):
         lines.append(f"On-screen text: {v.get('on_screen_text','')}")
         lines.append(f"Caption:\n{v.get('caption','')}")
         lines.append(f"Cover scene: {v.get('cover_scene','')}")
-        lines.append(f"Suno: {v.get('suno_prompt','')}")
+        # Renamed from suno_prompt -> soundtrack as of 2026-04-19
+        soundtrack = v.get("soundtrack") or v.get("suno_prompt", "")
+        lines.append(f"Soundtrack: {soundtrack}")
         lines.append(f"Transitions: {v.get('transitions','')}")
         lines.append(f"Notes: {v.get('notes','')}")
         lines.append("")  # blank line between variations
     return "\n".join(lines).strip()
 
 
-def create_script_row(variations, hook_type, content_split, reel_num, schema_props):
+def create_script_row(variations, hook_type, content_split, slot_date, schema_props):
     """Create a single Scripted row populated from the first variation, with
-    the other two serialized into the 'Alt Scripts' column for review."""
+    the other two serialized into the 'Alt Scripts' column for review.
+
+    As of 2026-04-19: Scripted rows have NO Reel # (Reel # is only assigned
+    when a row becomes Posted AND tagged Swirl Series). Identifier is
+    Slot Date instead. Tags Category = Swirl Series automatically.
+    """
     if isinstance(variations, dict):
         # Backwards-compat: a single script dict was passed
         variations = [variations]
@@ -1138,21 +1537,27 @@ def create_script_row(variations, hook_type, content_split, reel_num, schema_pro
     alts_blob = format_alt_scripts(variations) if len(variations) > 1 else ""
 
     title_prop = next((n for n, p in schema_props.items() if p["type"] == "title"), None)
+    # Writer returns 'soundtrack' (renamed from suno_prompt). Accept both for
+    # backwards compat with any in-flight responses.
+    soundtrack = main.get("soundtrack") or main.get("suno_prompt", "")
+
     updates = {
         title_prop: main["title"],
         "Status": "Scripted",
-        "Reel #": reel_num,
+        "Slot Date": slot_date,
         "Clip Order": main["clip_order"],
         "On-Screen Text": main["on_screen_text"],
         "Caption": main["caption"],
         "Hook Type": hook_type,
         "Content Split": content_split,
         "Cover Scene": main["cover_scene"],
-        "Suno Prompt": main["suno_prompt"],
+        "Soundtrack": soundtrack,
         "Transitions": main["transitions"],
         "Reel Total Time": main["reel_total_time"],
         "Notes": main["notes"],
     }
+    if "Category" in schema_props:
+        updates["Category"] = [CATEGORY_SWIRL]
     if alts_blob and "Alt Scripts" in schema_props:
         updates["Alt Scripts"] = alts_blob
 
@@ -1169,12 +1574,12 @@ def create_script_row(variations, hook_type, content_split, reel_num, schema_pro
 
 
 def should_generate_script_today() -> bool:
-    """True if today is Mon/Wed/Sat in America/Chicago local time, or if
-    FORCE_SCRIPT_GEN=1 is set in env."""
-    if FORCE_SCRIPT_GEN:
+    """True if today is Mon/Wed/Fri in America/Chicago local time, or if
+    FORCE_REGEN=1 is set in env."""
+    if FORCE_REGEN:
         return True
     # America/Chicago is UTC-6 (CST) or UTC-5 (CDT). For simplicity use UTC
-    # and accept a ~6h offset at the day boundary. We run at 15:00 UTC which
+    # and accept a ~6h offset at the day boundary. We run at 16:00 UTC which
     # is always mid-morning local, so UTC weekday == local weekday.
     return datetime.now(timezone.utc).weekday() in SCRIPT_GEN_WEEKDAYS
 
@@ -1186,6 +1591,9 @@ def main():
         "ig_fetched": 0,
         "metrics_refreshed": [],
         "promoted_to_posted": [],
+        "twins_created": [],
+        "others_created": [],
+        "aged_out_to_skipped": [],
         "unmatched_warnings": [],
         "frames_analyzed": [],
         "new_script_row": None,
@@ -1208,12 +1616,24 @@ def main():
         summary["ig_fetched"] = len(reels)
         print(f"IG: {len(reels)} reels fetched", file=sys.stderr)
 
+        # If TARGET_MEDIA_ID is set via workflow_dispatch, narrow the IG
+        # candidates to just that one reel (and skip every other path 1/2/3/4
+        # check entirely on the rest). Useful for reprocessing a specific
+        # off-script reel without touching the others.
+        if TARGET_MEDIA_ID:
+            reels = [r for r in reels if str(r.get("id")) == TARGET_MEDIA_ID]
+            print(
+                f"TARGET_MEDIA_ID set — narrowed to {len(reels)} reel(s) matching {TARGET_MEDIA_ID}",
+                file=sys.stderr,
+            )
+
         for r in reels:
             r["_insights"] = fetch_insights(r["id"])
 
-        refreshes, promotes, unmatched = reconcile(reels, rows, schema_props)
+        # 4-tier matcher
+        refreshes, promotes, twins, others = reconcile(reels, rows, schema_props)
 
-        # Refresh metrics on already-Posted rows
+        # Path 1: refresh metrics on already-Posted rows
         for page_id, reel in refreshes:
             try:
                 refresh_row_metrics(page_id, reel, schema_props)
@@ -1221,22 +1641,65 @@ def main():
             except Exception as e:
                 summary["errors"].append(f"refresh {page_id}: {e}")
 
-        # Promote newly-matched Scripted rows to Posted
+        # Reel # accounting — assign sequentially as we promote/create new
+        # Posted Swirl Series rows in this run. Start from current max + 1.
+        running_reel_num = next_swirl_reel_number(rows)
+
+        # Path 2: promote Scripted rows whose caption matched the plan
         for page_id, reel in promotes:
             try:
-                promote_row_to_posted(page_id, reel, schema_props)
-                summary["promoted_to_posted"].append(page_id)
+                promote_row_to_posted(page_id, reel, schema_props, running_reel_num)
+                summary["promoted_to_posted"].append(
+                    {"page_id": page_id, "reel_num": running_reel_num}
+                )
+                running_reel_num += 1
             except Exception as e:
                 summary["errors"].append(f"promote {page_id}: {e}")
 
-        # Log unmatched IG reels as warnings — never create new rows for them
-        for reel in unmatched:
-            cap = (reel.get("caption") or "").replace("\n", " ")[:80]
-            msg = f"unmatched IG reel {reel.get('id')} — '{cap}' — no Notion row; skipped"
-            print(f"  [warn] {msg}", file=sys.stderr)
-            summary["unmatched_warnings"].append(msg)
+        # Path 3: create Posted twins for off-script reels (with Off-Script Delta)
+        for scripted_row, reel in twins:
+            try:
+                delta = compute_off_script_delta(anthropic_client, scripted_row, reel)
+                new_page = create_posted_row(
+                    reel,
+                    schema_props,
+                    CATEGORY_SWIRL,
+                    original_plan_id=scripted_row["id"],
+                    off_script_delta=delta,
+                    reel_num=running_reel_num,
+                )
+                summary["twins_created"].append({
+                    "page_id": new_page["id"],
+                    "reel_num": running_reel_num,
+                    "original_plan_id": scripted_row["id"],
+                })
+                running_reel_num += 1
+            except Exception as e:
+                summary["errors"].append(f"twin {scripted_row.get('id')}: {e}")
 
-        # Re-query so frame analysis sees fresh state
+        # Path 4: create Other-tagged Posted rows for non-Swirl IG content
+        for reel in others:
+            try:
+                new_page = create_posted_row(
+                    reel,
+                    schema_props,
+                    CATEGORY_OTHER,
+                )
+                summary["others_created"].append({
+                    "page_id": new_page["id"],
+                    "ig_media_id": reel.get("id"),
+                })
+            except Exception as e:
+                summary["errors"].append(f"other {reel.get('id')}: {e}")
+
+        # Aging pass: Scripted rows with Slot Date > 7 days past -> Skipped.
+        try:
+            aged = age_out_scripted_rows(rows, schema_props)
+            summary["aged_out_to_skipped"] = aged
+        except Exception as e:
+            summary["errors"].append(f"age_out: {e}")
+
+        # Re-query so frame analysis + script gen see the fresh state.
         rows = notion_query_all()
 
         # Frame extraction + vision analysis for Posted rows missing analysis
@@ -1256,26 +1719,29 @@ def main():
             except Exception as e:
                 summary["errors"].append(f"frame analysis {row['id']}: {e}")
 
-        # Script generation — only on Mon/Wed/Sat (or if FORCE_SCRIPT_GEN=1)
+        # Script generation — only on Mon/Wed/Fri (or if FORCE_REGEN=1)
         if should_generate_script_today():
             # Re-query one more time so the analyst sees the frame analyses
             rows = notion_query_all()
             hook_type = pick_next_hook(rows)
             content_split = pick_next_split(rows)
-            next_reel_num = max_reel_number(rows) + 1
+            next_reel_num = next_swirl_reel_number(rows)
+            slot_date = next_open_slot_date(rows)
             print(
-                f"Next reel plan: #{next_reel_num} hook={hook_type} split={content_split}",
+                f"Next reel plan: Slot {slot_date} (will be #{next_reel_num} when posted) "
+                f"hook={hook_type} split={content_split}",
                 file=sys.stderr,
             )
             variations, _brief = generate_script_variations(
-                anthropic_client, rows, hook_type, content_split, next_reel_num
+                anthropic_client, rows, hook_type, content_split, next_reel_num, slot_date
             )
             new_page = create_script_row(
-                variations, hook_type, content_split, next_reel_num, schema_props
+                variations, hook_type, content_split, slot_date, schema_props
             )
             summary["new_script_row"] = {
                 "id": new_page["id"],
                 "reel_num": next_reel_num,
+                "slot_date": slot_date,
                 "title": variations[0]["title"],
                 "variation_labels": [v.get("variation_label", "?") for v in variations],
             }
@@ -1283,7 +1749,7 @@ def main():
             today = datetime.now(timezone.utc).strftime("%A")
             print(
                 f"Not a script-gen day ({today}) — skipping script generation. "
-                f"Set FORCE_SCRIPT_GEN=1 to override.",
+                f"Set FORCE_REGEN=1 to override.",
                 file=sys.stderr,
             )
             summary["script_gen_skipped"] = True
@@ -1294,27 +1760,36 @@ def main():
     # Summary
     print("\n=== Summary ===")
     print(f"IG reels fetched: {summary['ig_fetched']}")
-    print(f"Metrics refreshed on Posted rows: {len(summary['metrics_refreshed'])}")
+    print(f"Metrics refreshed on Posted rows (Path 1): {len(summary['metrics_refreshed'])}")
     for pid in summary["metrics_refreshed"]:
         print(f"  - {pid}")
-    print(f"Rows promoted Scripted→Posted: {len(summary['promoted_to_posted'])}")
-    for pid in summary["promoted_to_posted"]:
+    print(f"Scripted -> Posted promotions (Path 2, caption matched plan): {len(summary['promoted_to_posted'])}")
+    for entry in summary["promoted_to_posted"]:
+        print(f"  - {entry['page_id']} (Reel #{entry['reel_num']})")
+    print(f"Posted twins created (Path 3, off-script): {len(summary['twins_created'])}")
+    for entry in summary["twins_created"]:
+        print(f"  - {entry['page_id']} (Reel #{entry['reel_num']}, plan={entry['original_plan_id']})")
+    print(f"Other rows created (Path 4, non-Swirl): {len(summary['others_created'])}")
+    for entry in summary["others_created"]:
+        print(f"  - {entry['page_id']} (ig_id={entry['ig_media_id']})")
+    print(f"Scripted rows aged to Skipped (Slot Date > {SKIPPED_AGE_DAYS}d past): {len(summary['aged_out_to_skipped'])}")
+    for pid in summary["aged_out_to_skipped"]:
         print(f"  - {pid}")
-    print(f"Frames analyzed (first 10s vision): {len(summary['frames_analyzed'])}")
+    print(f"Frames analyzed (full-arc vision): {len(summary['frames_analyzed'])}")
     for pid in summary["frames_analyzed"]:
         print(f"  - {pid}")
-    print(f"Unmatched IG reels (skipped, no row created): {len(summary['unmatched_warnings'])}")
-    for msg in summary["unmatched_warnings"]:
-        print(f"  - {msg}")
     if summary["new_script_row"]:
         nsr = summary["new_script_row"]
-        print(f"New script row: Reel #{nsr['reel_num']} — {nsr['title']} ({nsr['id']})")
+        print(
+            f"New Scripted row: Slot {nsr['slot_date']} (will be #{nsr['reel_num']} when posted) "
+            f"— {nsr['title']} ({nsr['id']})"
+        )
         if nsr.get("variation_labels"):
             print(f"  Variations generated: {', '.join(nsr['variation_labels'])} (main=first, alts in 'Alt Scripts')")
     elif summary["script_gen_skipped"]:
-        print("New script row: (skipped — not a script-gen day)")
+        print("New Scripted row: (skipped — not a script-gen day)")
     else:
-        print("New script row: (not created)")
+        print("New Scripted row: (not created)")
     # Cost accounting
     print(f"\n=== Cost ===")
     print(f"Run total: ${_run_usage['total_usd']:.4f} (cap ${MAX_COST_PER_RUN_USD:.2f})")

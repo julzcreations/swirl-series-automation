@@ -2,17 +2,22 @@ name: Swirl Series Sync
 
 on:
   schedule:
-    # Daily at 15:00 UTC (= 10am CST / 11am CDT). The script itself gates
-    # script-generation to Mon/Wed/Sat; metrics refresh and frame analysis
-    # run every day so engagement numbers stay fresh and new posts get
-    # analyzed promptly.
-    - cron: '0 15 * * *'
+    # 16:00 UTC = 11am CDT (summer) / 10am CST (winter), Mon/Wed/Fri.
+    # Aligned to Julie's posting cadence so each run drafts that-day's reel.
+    # The script gates script-generation to weekday() in {0,2,4} (Mon/Wed/Fri).
+    # Metrics refresh + frame analysis + reconciliation run on every fired run.
+    - cron: '0 16 * * 1,3,5'
   workflow_dispatch:
     inputs:
-      force_script_gen:
+      force_regen:
         description: 'Force script generation even on non-gen days (true/false)'
         required: false
         default: 'false'
+        type: string
+      target_media_id:
+        description: 'Optional: narrow this run to a single IG media ID (for off-script reprocessing)'
+        required: false
+        default: ''
         type: string
 
 jobs:
@@ -51,7 +56,8 @@ jobs:
           ANALYST_MODEL: claude-opus-4-6
           WRITER_MODEL: claude-sonnet-4-6
           VISION_MODEL: claude-sonnet-4-6
-          FORCE_SCRIPT_GEN: ${{ inputs.force_script_gen || 'false' }}
+          FORCE_REGEN: ${{ inputs.force_regen || 'false' }}
+          TARGET_MEDIA_ID: ${{ inputs.target_media_id || '' }}
           MAX_COST_PER_RUN_USD: '2.00'
           # gh CLI needs auth to update the IG_TOKEN secret on auto-refresh.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
