@@ -1598,7 +1598,6 @@ def main():
         "frames_analyzed": [],
         "new_script_row": None,
         "script_gen_skipped": False,
-        "preflight_skipped": None,
         "errors": [],
     }
     anthropic_client = Anthropic(api_key=ANTHROPIC_KEY)
@@ -1617,33 +1616,17 @@ def main():
         summary["ig_fetched"] = len(reels)
         print(f"IG: {len(reels)} reels fetched", file=sys.stderr)
 
-        # Preflight count gate (added 2026-04-20 after an early-cron run
-        # created a junk row): on a scheduled run, require that IG has
-        # exactly one more post than Notion's Posted count. That's the
-        # only shape a "just posted one new reel" state can take. Any
-        # other delta means either nothing was posted yet (cron fired
-        # before Julie posted) or we're missing multiple reels (bulk
-        # backfill) — neither is safe to analyze automatically.
-        # Manual dispatches with TARGET_MEDIA_ID or FORCE_REGEN bypass
-        # the gate so off-script reprocessing still works.
-        if not TARGET_MEDIA_ID and not FORCE_REGEN:
-            notion_posted_count = sum(
-                1 for r in rows if read_prop(r, "Status") == "Posted"
-            )
-            expected_ig = notion_posted_count + 1
-            if len(reels) != expected_ig:
-                msg = (
-                    f"IG has {len(reels)} reels, Notion has "
-                    f"{notion_posted_count} Posted rows — expected IG to be "
-                    f"exactly one more ({expected_ig}). Skipping run."
-                )
-                print(f"PREFLIGHT SKIP: {msg}", file=sys.stderr)
-                print(f"\n=== Preflight skip ===\n{msg}")
-                summary["preflight_skipped"] = msg
-                post_run_to_julzops(
-                    summary, run_started, datetime.now(timezone.utc)
-                )
-                return
+        # Snapshot the pre-reconcile IG/Notion delta so the script-gen
+        # step later can tell whether this run actually had a new reel
+        # to learn from. Reconcile always runs (that's how Notion
+        # self-heals toward IG reality — unmatched reels become rows,
+        # stale Scripted rows age out). The count check only gates
+        # script generation, which is the step that fires "too early"
+        # when Julie hasn't posted yet.
+        pre_sync_ig_count = len(reels)
+        pre_sync_notion_posted = sum(
+            1 for r in rows if read_prop(r, "Status") == "Posted"
+        )
 
         # If TARGET_MEDIA_ID is set via workflow_dispatch, narrow the IG
         # candidates to just that one reel (and skip every other path 1/2/3/4
@@ -1749,7 +1732,26 @@ def main():
                 summary["errors"].append(f"frame analysis {row['id']}: {e}")
 
         # Script generation — only on Mon/Wed/Fri (or if FORCE_REGEN=1)
-        if should_generate_script_today():
+        # Additional gate: at run start, IG must have been exactly one more
+        # than Notion's Posted count (the "one new reel just posted" shape).
+        # Any other delta means either Julie hasn't posted today yet (cron
+        # fired early) or something else is off — generating a new script
+        # now would be based on stale data and create a duplicate Scripted
+        # row. FORCE_REGEN bypasses this gate for manual dispatch.
+        new_reel_pending_at_start = (
+            pre_sync_ig_count == pre_sync_notion_posted + 1
+        )
+        if should_generate_script_today() and not new_reel_pending_at_start and not FORCE_REGEN:
+            msg = (
+                f"Script-gen day, but at run start IG had {pre_sync_ig_count} "
+                f"reels and Notion had {pre_sync_notion_posted} Posted rows "
+                f"(expected IG=+1). No fresh reel to analyze — skipping "
+                f"script generation. Reconcile still ran. "
+                f"Set FORCE_REGEN=1 to override."
+            )
+            print(msg, file=sys.stderr)
+            summary["script_gen_skipped"] = True
+        elif should_generate_script_today():
             # Re-query one more time so the analyst sees the frame analyses
             rows = notion_query_all()
             hook_type = pick_next_hook(rows)
