@@ -1598,6 +1598,7 @@ def main():
         "frames_analyzed": [],
         "new_script_row": None,
         "script_gen_skipped": False,
+        "preflight_skipped": None,
         "errors": [],
     }
     anthropic_client = Anthropic(api_key=ANTHROPIC_KEY)
@@ -1615,6 +1616,34 @@ def main():
         reels = fetch_ig_reels()
         summary["ig_fetched"] = len(reels)
         print(f"IG: {len(reels)} reels fetched", file=sys.stderr)
+
+        # Preflight count gate (added 2026-04-20 after an early-cron run
+        # created a junk row): on a scheduled run, require that IG has
+        # exactly one more post than Notion's Posted count. That's the
+        # only shape a "just posted one new reel" state can take. Any
+        # other delta means either nothing was posted yet (cron fired
+        # before Julie posted) or we're missing multiple reels (bulk
+        # backfill) — neither is safe to analyze automatically.
+        # Manual dispatches with TARGET_MEDIA_ID or FORCE_REGEN bypass
+        # the gate so off-script reprocessing still works.
+        if not TARGET_MEDIA_ID and not FORCE_REGEN:
+            notion_posted_count = sum(
+                1 for r in rows if read_prop(r, "Status") == "Posted"
+            )
+            expected_ig = notion_posted_count + 1
+            if len(reels) != expected_ig:
+                msg = (
+                    f"IG has {len(reels)} reels, Notion has "
+                    f"{notion_posted_count} Posted rows — expected IG to be "
+                    f"exactly one more ({expected_ig}). Skipping run."
+                )
+                print(f"PREFLIGHT SKIP: {msg}", file=sys.stderr)
+                print(f"\n=== Preflight skip ===\n{msg}")
+                summary["preflight_skipped"] = msg
+                post_run_to_julzops(
+                    summary, run_started, datetime.now(timezone.utc)
+                )
+                return
 
         # If TARGET_MEDIA_ID is set via workflow_dispatch, narrow the IG
         # candidates to just that one reel (and skip every other path 1/2/3/4
