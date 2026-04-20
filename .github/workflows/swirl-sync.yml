@@ -54,9 +54,9 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANALYST_MODEL: claude-opus-4-6
+          ANALYST_MODEL: claude-sonnet-4-6
           WRITER_MODEL: claude-sonnet-4-6
-          VISION_MODEL: claude-sonnet-4-6
+          VISION_MODEL: claude-haiku-4-5-20251001
           FORCE_REGEN: ${{ inputs.force_regen || 'false' }}
           TARGET_MEDIA_ID: ${{ inputs.target_media_id || '' }}
           MAX_COST_PER_RUN_USD: '2.00'

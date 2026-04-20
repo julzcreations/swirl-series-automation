@@ -56,11 +56,16 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 # If either env var is missing, the POST is a no-op.
 JULZOPS_INGEST_URL = os.environ.get("JULZOPS_INGEST_URL", "")
 JULZOPS_INGEST_SECRET = os.environ.get("JULZOPS_INGEST_SECRET", "")
-# Two-model setup: Opus reasons over past performance, Sonnet turns the brief
-# into the final reel script JSON, and Sonnet Vision analyzes first-10s frames.
-ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-opus-4-6")
+# Three-model setup (2026-04-20 cost-optimization pass):
+#   Analyst = Sonnet 4.6  — reasons over past performance + off-script deltas
+#   Writer  = Sonnet 4.6  — turns the brief into the final reel script JSON
+#   Vision  = Haiku 4.5   — analyzes 15-frame reel arc (visual description
+#                           is well within Haiku's range; 3.75x cheaper than Sonnet)
+# Prior setup used Opus 4.6 for the analyst — downshifted to Sonnet because the
+# task is pattern-matching over structured history, not open-ended reasoning.
+ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-sonnet-4-6")
 WRITER_MODEL = os.environ.get("WRITER_MODEL", "claude-sonnet-4-6")
-VISION_MODEL = os.environ.get("VISION_MODEL", "claude-sonnet-4-6")
+VISION_MODEL = os.environ.get("VISION_MODEL", "claude-haiku-4-5-20251001")
 # Script generation runs on Mon=0, Wed=2, Fri=4 (Python weekday() numbering).
 # Aligned to posting cadence so each run drafts that-day's reel.
 SCRIPT_GEN_WEEKDAYS = {0, 2, 4}
@@ -1370,7 +1375,7 @@ def _call_claude(client, model, prompt, max_tokens):
 
 
 def analyze_context(client, rows, hook_type, content_split, next_reel_num, slot_date):
-    """Pass 1 — Opus analyst: strategic reasoning over real performance data.
+    """Pass 1 — Sonnet analyst: strategic reasoning over real performance data.
 
     Filters Swirl Series rows for the script-gen reasoning loop. Surfaces a
     small sample of Other-tagged rows for cross-category awareness. Top-3
@@ -1477,7 +1482,7 @@ def write_script(client, brief, hook_type, content_split, variation_label, varia
 
 def generate_script_variations(client, rows, hook_type, content_split, next_reel_num, slot_date):
     """Two-stage pipeline:
-    1. Opus analyst produces one creative brief (shared across all variants).
+    1. Sonnet analyst produces one creative brief (shared across all variants).
     2. Sonnet writer is called 3x with different variation directives,
        returning (variations_list, brief).
 

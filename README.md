@@ -88,11 +88,42 @@ gh run watch
 
 | Env var | Default | Role |
 | --- | --- | --- |
-| `ANALYST_MODEL` | `claude-opus-4-6` | Reasons over past performance + Off-Script Delta history, picks theme/angle, surfaces divergence patterns |
+| `ANALYST_MODEL` | `claude-sonnet-4-6` | Reasons over past performance + Off-Script Delta history, picks theme/angle, surfaces divergence patterns |
 | `WRITER_MODEL` | `claude-sonnet-4-6` | Writes the final reel script JSON + computes Off-Script Delta on Posted twins |
-| `VISION_MODEL` | `claude-sonnet-4-6` | Analyzes 15-frame reel arc for retention learning |
+| `VISION_MODEL` | `claude-haiku-4-5-20251001` | Analyzes 15-frame reel arc for retention learning |
 
-To run cheaper, set both `ANALYST_MODEL` and `WRITER_MODEL` to `claude-sonnet-4-6` (~$0.015/run vs ~$0.065).
+### Pricing (per 1M tokens, input / output)
+
+| Model | Input | Output |
+| --- | --- | --- |
+| Opus 4.6 (prior analyst) | $15 | $75 |
+| Sonnet 4.6 (analyst + writer) | $3 | $15 |
+| Haiku 4.5 (vision) | $0.80 | $4 |
+
+### Per-run cost breakdown (post-optimization, 2026-04-20)
+
+Each Mon/Wed/Fri run is a script-gen day, so all four call types fire:
+
+| Call | Model | ~Input tokens | ~Output tokens | Cost / call | Calls / run | Subtotal |
+| --- | --- | --- | --- | --- | --- | --- |
+| Analyst | Sonnet 4.6 | 10,000 | 900 | $0.044 | 1 | $0.044 |
+| Writer | Sonnet 4.6 | 1,500 | 1,500 | $0.027 | 3 | $0.081 |
+| Vision (per unanalyzed reel) | Haiku 4.5 | 23,000 | 500 | $0.020 | 0–1 | ~$0.010 |
+| Off-script delta (per new twin) | Sonnet 4.6 | 1,000 | 300 | $0.008 | 0–1 | ~$0.004 |
+| **Per run** |  |  |  |  |  | **~$0.14** |
+
+### Monthly estimate
+
+- 13 runs/month (3x/week) × ~$0.14 = **~$1.85/mo**
+- Annual: ~$22/year
+- Prior setup (Opus analyst + Sonnet vision): ~$5.00/mo → ~$60/year
+- **Phase 1 savings: ~63% / ~$38/year**
+
+### Cost levers if spend becomes a concern
+
+- `ANALYST_MODEL=claude-haiku-4-5-20251001` — further 75% cut on analyst calls (~$0.40/mo). Tradeoff: Haiku may miss subtler divergence patterns in the Off-Script Delta history. Try and roll back if briefs feel shallow.
+- `MAX_COST_PER_RUN_USD` (default $2.00) is the hard abort budget — lowering it to `0.50` would fail fast on any pricing/prompt blow-up.
+- All usage is tracked per-call via `track_usage()` in `sync.py` and POSTed to JulzOps for long-term cost visibility.
 
 ## Notion schema
 
