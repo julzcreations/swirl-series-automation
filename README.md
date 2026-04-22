@@ -92,38 +92,11 @@ gh run watch
 | `WRITER_MODEL` | `claude-sonnet-4-6` | Writes the final reel script JSON + computes Off-Script Delta on Posted twins |
 | `VISION_MODEL` | `claude-haiku-4-5-20251001` | Analyzes 15-frame reel arc for retention learning |
 
-### Pricing (per 1M tokens, input / output)
+### Cost
 
-| Model | Input | Output |
-| --- | --- | --- |
-| Opus 4.6 (prior analyst) | $15 | $75 |
-| Sonnet 4.6 (analyst + writer) | $3 | $15 |
-| Haiku 4.5 (vision) | $0.80 | $4 |
+Cost is tracked centrally in JulzOps via Anthropic's [Cost API](https://platform.claude.com/docs/en/build-with-claude/usage-cost-api) — see `julzops/src/app/api/jobs/reconcile-usage/route.ts`. The hourly pull returns authoritative per-workspace dollar amounts, so no rate-card multiplication lives here anymore. To see current spend, open JulzOps or `platform.claude.com/settings/cost`.
 
-### Per-run cost breakdown (post-optimization, 2026-04-20)
-
-Each Mon/Wed/Fri run is a script-gen day, so all four call types fire:
-
-| Call | Model | ~Input tokens | ~Output tokens | Cost / call | Calls / run | Subtotal |
-| --- | --- | --- | --- | --- | --- | --- |
-| Analyst | Sonnet 4.6 | 10,000 | 900 | $0.044 | 1 | $0.044 |
-| Writer | Sonnet 4.6 | 1,500 | 1,500 | $0.027 | 3 | $0.081 |
-| Vision (per unanalyzed reel) | Haiku 4.5 | 23,000 | 500 | $0.020 | 0–1 | ~$0.010 |
-| Off-script delta (per new twin) | Sonnet 4.6 | 1,000 | 300 | $0.008 | 0–1 | ~$0.004 |
-| **Per run** |  |  |  |  |  | **~$0.14** |
-
-### Monthly estimate
-
-- 13 runs/month (3x/week) × ~$0.14 = **~$1.85/mo**
-- Annual: ~$22/year
-- Prior setup (Opus analyst + Sonnet vision): ~$5.00/mo → ~$60/year
-- **Phase 1 savings: ~63% / ~$38/year**
-
-### Cost levers if spend becomes a concern
-
-- `ANALYST_MODEL=claude-haiku-4-5-20251001` — further 75% cut on analyst calls (~$0.40/mo). Tradeoff: Haiku may miss subtler divergence patterns in the Off-Script Delta history. Try and roll back if briefs feel shallow.
-- `MAX_COST_PER_RUN_USD` (default $2.00) is the hard abort budget — lowering it to `0.50` would fail fast on any pricing/prompt blow-up.
-- All usage is tracked per-call via `track_usage()` in `sync.py` and POSTed to JulzOps for long-term cost visibility.
+If you want to reduce spend, the main lever is the `ANALYST_MODEL` env var — swap Sonnet for Haiku for a further ~75% cut on analyst calls (at the cost of some reasoning depth on Off-Script Delta patterns).
 
 ## Notion schema
 

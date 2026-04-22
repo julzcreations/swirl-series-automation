@@ -94,50 +94,11 @@ SKIPPED_AGE_DAYS = 7
 CATEGORY_SWIRL = "Swirl Series"
 CATEGORY_OTHER = "Other"
 
-# ---- Cost tracking ----
-# Per-million-token pricing in USD, from anthropic.com/pricing (2026).
-MODEL_PRICING = {
-    "claude-opus-4-6": (15.0, 75.0),
-    "claude-opus-4-6[1m]": (15.0, 75.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-haiku-4-5-20251001": (0.80, 4.0),
-}
-# Hard abort if a single run would exceed this (safety net against loops/bugs).
-MAX_COST_PER_RUN_USD = float(os.environ.get("MAX_COST_PER_RUN_USD", "2.00"))
-
-# Module-level cost tracker. Populated by track_usage() and read in main()'s summary.
-_run_usage = {
-    "total_usd": 0.0,
-    "by_model": {},  # model → {"input_tokens": int, "output_tokens": int, "cost_usd": float, "calls": int}
-}
-
-
-def track_usage(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Compute and record the $ cost of one API call. Returns the cost."""
-    pricing = MODEL_PRICING.get(model)
-    if not pricing:
-        # Unknown model — record tokens but zero cost (conservative).
-        cost = 0.0
-    else:
-        in_price, out_price = pricing
-        cost = (input_tokens / 1_000_000.0) * in_price + (output_tokens / 1_000_000.0) * out_price
-    _run_usage["total_usd"] += cost
-    bucket = _run_usage["by_model"].setdefault(
-        model, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
-    )
-    bucket["input_tokens"] += input_tokens
-    bucket["output_tokens"] += output_tokens
-    bucket["cost_usd"] += cost
-    bucket["calls"] += 1
-    return cost
-
-
-def check_budget():
-    """Abort the run if total cost has exceeded MAX_COST_PER_RUN_USD."""
-    if _run_usage["total_usd"] >= MAX_COST_PER_RUN_USD:
-        raise RuntimeError(
-            f"Run cost ${_run_usage['total_usd']:.4f} reached max ${MAX_COST_PER_RUN_USD:.2f} — aborting."
-        )
+# Cost tracking was removed when JulzOps gained access to the Anthropic
+# Cost API (via Organization-tier admin keys). See
+# julzops/src/app/api/jobs/reconcile-usage/route.ts — that route pulls
+# authoritative per-workspace dollar amounts hourly. Local rate-card
+# multiplication is no longer needed.
 
 
 def post_run_to_julzops(summary: dict, started_at: datetime, ended_at: datetime) -> None:
@@ -146,19 +107,14 @@ def post_run_to_julzops(summary: dict, started_at: datetime, ended_at: datetime)
 
     The env vars JULZOPS_INGEST_URL + JULZOPS_INGEST_SECRET must both be set
     (they are in GH Actions secrets). If either is missing this is a no-op.
+
+    Only non-cost run metadata is sent (reconciled counts, next-script info,
+    timings, status). Cost is tracked separately via the Anthropic Cost API
+    pull in JulzOps.
     """
     if not JULZOPS_INGEST_URL or not JULZOPS_INGEST_SECRET:
         return
     try:
-        by_model = {
-            model: {
-                "calls": b["calls"],
-                "inputTokens": b["input_tokens"],
-                "outputTokens": b["output_tokens"],
-                "costUsd": b["cost_usd"],
-            }
-            for model, b in _run_usage["by_model"].items()
-        }
         status = "failure" if summary.get("errors") else "success"
         run_url = None
         repo = os.environ.get("GITHUB_REPOSITORY")
@@ -192,10 +148,6 @@ def post_run_to_julzops(summary: dict, started_at: datetime, ended_at: datetime)
                     "title": new_script["title"],
                 } if new_script else None,
                 "errors": summary.get("errors", [])[:10],
-            },
-            "usage": {
-                "totalUsd": round(_run_usage["total_usd"], 6),
-                "byModel": by_model,
             },
         }
         r = requests.post(
@@ -848,20 +800,11 @@ def compute_off_script_delta(client, scripted_row, reel) -> str:
         posted_date=posted_date or "(unknown)",
     )
     try:
-        check_budget()
         msg = client.messages.create(
             model=WRITER_MODEL,  # Sonnet is plenty for this — short, structured
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )
-        usage = getattr(msg, "usage", None)
-        if usage is not None:
-            cost = track_usage(WRITER_MODEL, usage.input_tokens, usage.output_tokens)
-            print(
-                f"  [cost] {WRITER_MODEL} (off-script delta): "
-                f"{usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
-                file=sys.stderr,
-            )
         text = "".join(b.text for b in msg.content if b.type == "text").strip()
         return text[:1500]  # cap to a reasonable length
     except Exception as e:
@@ -1049,19 +992,11 @@ def analyze_first_10s(client, frame_paths, caption):
         except Exception as e:
             print(f"  [warn] couldn't encode {fp}: {e}", file=sys.stderr)
     try:
-        check_budget()
         msg = client.messages.create(
             model=VISION_MODEL,
             max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
-        usage = getattr(msg, "usage", None)
-        if usage is not None:
-            cost = track_usage(VISION_MODEL, usage.input_tokens, usage.output_tokens)
-            print(
-                f"  [cost] {VISION_MODEL} (vision): {usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
-                file=sys.stderr,
-            )
         text = "".join(b.text for b in msg.content if b.type == "text").strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
@@ -1355,19 +1290,11 @@ def watch_time_seconds(row):
 
 # ---- Claude call helpers ----
 def _call_claude(client, model, prompt, max_tokens):
-    check_budget()
     msg = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
-    usage = getattr(msg, "usage", None)
-    if usage is not None:
-        cost = track_usage(model, usage.input_tokens, usage.output_tokens)
-        print(
-            f"  [cost] {model}: {usage.input_tokens} in + {usage.output_tokens} out = ${cost:.4f}",
-            file=sys.stderr,
-        )
     text = "".join(b.text for b in msg.content if b.type == "text").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
@@ -1826,15 +1753,9 @@ def main():
         print("New Scripted row: (skipped — not a script-gen day)")
     else:
         print("New Scripted row: (not created)")
-    # Cost accounting
-    print(f"\n=== Cost ===")
-    print(f"Run total: ${_run_usage['total_usd']:.4f} (cap ${MAX_COST_PER_RUN_USD:.2f})")
-    for model, b in sorted(_run_usage["by_model"].items()):
-        print(
-            f"  {model}: {b['calls']} call(s) | "
-            f"{b['input_tokens']} in + {b['output_tokens']} out tokens | "
-            f"${b['cost_usd']:.4f}"
-        )
+    # Cost is tracked centrally in JulzOps via the Anthropic Cost API; see
+    # julzops/src/app/api/jobs/reconcile-usage/route.ts. Local accounting was
+    # removed when the Admin API became available on Organization accounts.
 
     # Ship run summary to JulzOps (non-fatal — never blocks exit)
     post_run_to_julzops(summary, run_started, datetime.now(timezone.utc))
