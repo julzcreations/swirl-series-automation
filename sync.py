@@ -56,14 +56,20 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 # If either env var is missing, the POST is a no-op.
 JULZOPS_INGEST_URL = os.environ.get("JULZOPS_INGEST_URL", "")
 JULZOPS_INGEST_SECRET = os.environ.get("JULZOPS_INGEST_SECRET", "")
-# Three-model setup (2026-04-20 cost-optimization pass):
-#   Analyst = Sonnet 4.6  — reasons over past performance + off-script deltas
-#   Writer  = Sonnet 4.6  — turns the brief into the final reel script JSON
-#   Vision  = Haiku 4.5   — analyzes 15-frame reel arc (visual description
-#                           is well within Haiku's range; 3.75x cheaper than Sonnet)
-# Prior setup used Opus 4.6 for the analyst — downshifted to Sonnet because the
-# task is pattern-matching over structured history, not open-ended reasoning.
-ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-sonnet-4-6")
+# Model routing by task fit (2026-04-26 revert pass):
+#   Analyst = Opus 4.7   — judgment work: theme picks, dupe warnings, deciding
+#                          which past reels are shaping the next call. Reasoning
+#                          quality is the lever here, not cost.
+#   Writer  = Sonnet 4.6 — voice + variation across 3 script drafts. Brand voice
+#                          (warm, intimate, casual) is Sonnet's mid-range
+#                          strength; Haiku flattens it.
+#   Vision  = Haiku 4.5  — frame description, well within Haiku's range;
+#                          ~3.75x cheaper than Sonnet for this workload.
+# Earlier 2026-04-20 pass downshifted analyst Opus -> Sonnet under the assumption
+# that the task was pattern-matching over structured history. Reverted: the
+# analyst makes real judgment calls (theme/angle/dupe warnings), and the
+# +$2/month cost delta is trivial vs the reasoning lift.
+ANALYST_MODEL = os.environ.get("ANALYST_MODEL", "claude-opus-4-7")
 WRITER_MODEL = os.environ.get("WRITER_MODEL", "claude-sonnet-4-6")
 VISION_MODEL = os.environ.get("VISION_MODEL", "claude-haiku-4-5-20251001")
 # Script generation runs on Mon=0, Wed=2, Fri=4 (Python weekday() numbering).

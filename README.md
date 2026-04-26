@@ -1,8 +1,8 @@
 # Swirl Series Automation
 
-GitHub Actions job that keeps the Swirl Series content calendar in sync with Instagram, then drafts the next reel script.
+GitHub Actions cron that keeps the Swirl Series content calendar in sync with Instagram, then drafts the next reel script.
 
-**Major rewrite 2026-04-19** — see `~/.claude/plans/can-we-reexamine-the-snoopy-swing.md` for the full plan and `~/.claude/projects/.../memory/project_swirl_series_automation.md` for the canonical project memory.
+Three-role Claude pipeline: **Opus** for analyst judgment, **Sonnet** for the writer's voice, **Haiku** for frame-level vision analysis. Designed for cost-aware per-task model routing rather than blanket model selection.
 
 ## Schedule
 
@@ -18,7 +18,7 @@ Runs at **16:00 UTC on Mon/Wed/Fri** = 11am CDT (summer) / 10am CST (winter), al
    - **Path 4 — no Swirl Series match** → create a Posted row tagged `Category = Other`. Captures every IG post for cross-category analytics.
 3. **Ages out** stale Scripted rows: if a `Slot Date` is more than 7 days in the past with no match, status flips to `Skipped`.
 4. **Frame-extracts + vision-analyzes** any Posted row missing analysis (15 frames covering the full reel arc, weighted toward the retention-critical first 2.5s).
-5. **On script-gen days** (Mon/Wed/Fri), drafts ONE new Scripted row for the next available Slot Date via the two-model pipeline.
+5. **On script-gen days** (Mon/Wed/Fri), drafts ONE new Scripted row for the next available Slot Date via the three-role Claude pipeline.
 
 Idempotent — running twice in the same day is a no-op on existing matches and won't duplicate Posted twins.
 
@@ -86,17 +86,19 @@ gh run watch
 
 ## Model configuration
 
-| Env var | Default | Role |
-| --- | --- | --- |
-| `ANALYST_MODEL` | `claude-sonnet-4-6` | Reasons over past performance + Off-Script Delta history, picks theme/angle, surfaces divergence patterns |
-| `WRITER_MODEL` | `claude-sonnet-4-6` | Writes the final reel script JSON + computes Off-Script Delta on Posted twins |
-| `VISION_MODEL` | `claude-haiku-4-5-20251001` | Analyzes 15-frame reel arc for retention learning |
+Models are routed by task fit rather than picked uniformly:
+
+| Env var | Default | Role | Why this model |
+| --- | --- | --- | --- |
+| `ANALYST_MODEL` | `claude-opus-4-7` | Reasons over past performance + Off-Script Delta history, picks theme/angle, warns off duplicates | Judgment-heavy task; reasoning quality is the lever, not cost |
+| `WRITER_MODEL` | `claude-sonnet-4-6` | Writes the final reel script JSON across 3 variations + computes Off-Script Delta on Posted twins | Brand voice (warm, intimate, casual) needs Sonnet's mid-range — Haiku flattens it |
+| `VISION_MODEL` | `claude-haiku-4-5-20251001` | Analyzes 15-frame reel arc for retention learning | Visual description is well within Haiku's range; ~3.75x cheaper than Sonnet for this workload |
 
 ### Cost
 
-Cost is tracked centrally in JulzOps via Anthropic's [Cost API](https://platform.claude.com/docs/en/build-with-claude/usage-cost-api) — see `julzops/src/app/api/jobs/reconcile-usage/route.ts`. The hourly pull returns authoritative per-workspace dollar amounts, so no rate-card multiplication lives here anymore. To see current spend, open JulzOps or `platform.claude.com/settings/cost`.
+~$5/month operating cost across ~12 script-generation days. The biggest lever is the analyst model — `ANALYST_MODEL=claude-sonnet-4-6` cuts cost ~50% if reasoning depth on theme picks isn't critical for your use case.
 
-If you want to reduce spend, the main lever is the `ANALYST_MODEL` env var — swap Sonnet for Haiku for a further ~75% cut on analyst calls (at the cost of some reasoning depth on Off-Script Delta patterns).
+Cost is tracked via Anthropic's [Cost API](https://platform.claude.com/docs/en/build-with-claude/usage-cost-api) — `platform.claude.com/settings/cost` shows authoritative per-workspace dollar amounts.
 
 ## Notion schema
 
@@ -131,12 +133,12 @@ export ANTHROPIC_API_KEY=...
 python sync.py
 ```
 
-## On-demand re-examine via Claude chat
+## On-demand re-examine via Claude Code
 
-The local Claude memory file `feedback_swirl_offscript_trigger.md` recognizes phrases like "I went off-script" / "re-examine the latest reel" / "rethink the next reel based on what I actually posted" and invokes:
+A local Claude Code memory rule recognizes phrases like "I went off-script" / "re-examine the latest reel" / "rethink the next reel based on what I actually posted" and invokes:
 
 ```bash
-gh workflow run swirl-sync.yml --repo jw-yue/swirl-series-automation -f force_regen=true
+gh workflow run swirl-sync.yml --repo julzcreations/swirl-series-automation -f force_regen=true
 ```
 
-If you name a specific reel, it adds `-f target_media_id=<id>`. The chat session polls the run, fetches the resulting Notion page URL, and surfaces it back.
+If a specific reel is named, the trigger adds `-f target_media_id=<id>`. The session then polls the run, fetches the resulting Notion page URL, and surfaces it back.
