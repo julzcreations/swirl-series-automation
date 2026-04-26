@@ -919,7 +919,9 @@ FRAME_TIMESTAMPS = [
 
 
 def extract_frames(mp4_path: str, out_dir: str) -> list:
-    """Extract 7 frames at FRAME_TIMESTAMPS using ffmpeg. Returns list of paths."""
+    """Extract up to 15 frames at FRAME_TIMESTAMPS using ffmpeg. Returns list
+    of paths. Timestamps past the reel's actual duration are silently dropped
+    by ffmpeg, so shorter reels yield fewer frames."""
     frame_paths = []
     for i, ts in enumerate(FRAME_TIMESTAMPS):
         out = os.path.join(out_dir, f"frame_{i:02d}_{int(ts*10):03d}.jpg")
